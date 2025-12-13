@@ -1,0 +1,5 @@
+/dataset_yolo/
+/downloads/
+/runs/
+*.pt
+*.gif
