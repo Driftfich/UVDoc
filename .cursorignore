@@ -3,4 +3,6 @@
 images/
 labels/
 downloads/
+train/
+val/
 *.pt

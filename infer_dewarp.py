@@ -19,6 +19,228 @@ def _robust_mad(x: np.ndarray) -> float:
     return 1.4826 * mad
 
 
+def resample_path(path: np.ndarray, n: int) -> np.ndarray:
+    """Resample a 2D path to n equidistant points."""
+    if len(path) < 2:
+        return np.tile(path[0], (n, 1))
+
+    diff = path[1:] - path[:-1]
+    dists = np.linalg.norm(diff, axis=1)
+    cum_dist = np.concatenate(([0], np.cumsum(dists)))
+    total = cum_dist[-1]
+
+    if total <= 1e-6:
+        return np.tile(path[0], (n, 1))
+
+    target = np.linspace(0, total, n)
+    x = np.interp(target, cum_dist, path[:, 0])
+    y = np.interp(target, cum_dist, path[:, 1])
+
+    return np.stack([x, y], axis=1).astype(np.float32)
+
+
+def get_smart_segment(contour, idx_start, idx_end):
+    """
+    Extract the contour segment from idx_start to idx_end.
+    Chooses the direction (forward/backward indices) that corresponds
+    to the shorter physical path (assuming the edge is shorter than the rest of the perimeter).
+    """
+    L = len(contour)
+    if idx_start == idx_end:
+        return contour[idx_start : idx_start + 1]
+
+    # Normalize indices
+    idx_start = idx_start % L
+    idx_end = idx_end % L
+
+    # 1. Forward path (following index order)
+    if idx_end >= idx_start:
+        path_fwd = contour[idx_start : idx_end + 1]
+    else:
+        path_fwd = np.concatenate((contour[idx_start:], contour[: idx_end + 1]))
+
+    dist_fwd = np.sum(np.linalg.norm(path_fwd[1:] - path_fwd[:-1], axis=1))
+
+    # Calculate total perimeter to compare
+    diffs = contour[1:] - contour[:-1]
+    total_len = np.sum(np.linalg.norm(diffs, axis=1)) + np.linalg.norm(
+        contour[0] - contour[-1]
+    )
+
+    # 2. Backward path (reverse index order)
+    if idx_start >= idx_end:
+        path_rev = contour[idx_end : idx_start + 1][::-1]
+    else:
+        # wrap around 0
+        p1 = contour[0 : idx_start + 1][::-1]
+        p2 = contour[idx_end:][::-1]
+        path_rev = np.concatenate((p1, p2))
+        
+    dist_rev = np.sum(np.linalg.norm(path_rev[1:] - path_rev[:-1], axis=1))
+
+    # Pick the shorter one
+    if dist_fwd <= dist_rev:
+        return path_fwd
+    else:
+        return path_rev
+
+
+def snap_grid_to_contour(grid_abs, contour, corners_idxs, n):
+    """
+    Adjust the boundary of grid_abs to lie on the provided contour.
+    corners_idxs: [TL_idx, TR_idx, BR_idx, BL_idx] indices into contour.
+    """
+    result_grid = grid_abs.copy()
+
+    # 1. Resample segments for each side using identified corners
+    # Top: TL -> TR
+    seg_top = get_smart_segment(contour, corners_idxs[0], corners_idxs[1])
+    pts_top = resample_path(seg_top, n)
+    result_grid[0, :, :] = pts_top
+
+    # Right: TR -> BR
+    seg_right = get_smart_segment(contour, corners_idxs[1], corners_idxs[2])
+    pts_right = resample_path(seg_right, n)
+    result_grid[:, -1, :] = pts_right
+
+    # Bottom: BL -> BR (Note: grid row -1 goes BL->BR)
+    # So we want path from corners_idxs[3] (BL) to corners_idxs[2] (BR)
+    seg_bottom = get_smart_segment(contour, corners_idxs[3], corners_idxs[2])
+    pts_bottom = resample_path(seg_bottom, n)
+    result_grid[-1, :, :] = pts_bottom
+
+    # Left: TL -> BL (Note: grid col 0 goes TL->BL)
+    # Path from corners_idxs[0] (TL) to corners_idxs[3] (BL)
+    seg_left = get_smart_segment(contour, corners_idxs[0], corners_idxs[3])
+    pts_left = resample_path(seg_left, n)
+    result_grid[:, 0, :] = pts_left
+
+    return result_grid
+
+
+def order_points_quad(pts):
+    """
+    Sort 4 points into TL, TR, BR, BL order.
+    """
+    # Sort by y first (top vs bottom)
+    pts = pts[np.argsort(pts[:, 1])]
+    
+    # Top 2 points
+    top = pts[:2]
+    # Bottom 2 points
+    bottom = pts[2:]
+    
+    # Sort top by x -> TL, TR
+    top = top[np.argsort(top[:, 0])]
+    tl, tr = top[0], top[1]
+    
+    # Sort bottom by x -> BL, BR
+    bottom = bottom[np.argsort(bottom[:, 0])]
+    bl, br = bottom[0], bottom[1]
+    
+    # Return in order TL, TR, BR, BL
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+
+def get_document_contour(img_bgr, bbox_xyxy):
+    """
+    Detect largest contour in the bounding box and identify its 4 corners.
+    Returns: (contour_points, corner_indices) or None
+    """
+    x1, y1, x2, y2 = map(int, bbox_xyxy)
+    h, w = img_bgr.shape[:2]
+    
+    # Slight padding for crop
+    pad = 10
+    bx1 = max(0, x1 - pad)
+    by1 = max(0, y1 - pad)
+    bx2 = min(w, x2 + pad)
+    by2 = min(h, y2 + pad)
+
+    crop = img_bgr[by1:by2, bx1:bx2]
+    if crop.size == 0:
+        return None
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+    # Edge detection
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    dilated = cv2.dilate(edges, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    # Filter by area
+    cnt = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(cnt)
+    if area < 0.1 * (crop.shape[0] * crop.shape[1]):
+        return None
+
+    # We need to find the 4 corners on this contour.
+    # 1. Approximate polygon
+    epsilon_start = 0.01
+    approx = None
+    for factor in range(1, 10):
+        ep = epsilon_start * factor * cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, ep, True)
+        if len(approx) == 4:
+            break
+    
+    # If we still don't have 4 points, force it by convex hull -> simplification
+    if len(approx) != 4:
+        hull = cv2.convexHull(cnt)
+        # Try to reduce hull to 4 points
+        for factor in range(1, 20):
+            ep = 0.01 * factor * cv2.arcLength(hull, True)
+            approx = cv2.approxPolyDP(hull, ep, True)
+            if len(approx) <= 4:
+                break
+                
+    # If we have < 4 points (e.g. triangle), it's bad.
+    # If we have > 4 points, we just pick the bounding box corners of the contour?
+    # Or picking the 4 points with max distance from center?
+    
+    target_corners = None
+    
+    if len(approx) == 4:
+        target_corners = approx.reshape(4, 2)
+    else:
+        # Fallback: Find 4 extreme points on the contour
+        # (Min sum, Max sum, Min diff, Max diff) approach usually works for rectangles
+        # Sum = x+y, Diff = y-x
+        pts = cnt.reshape(-1, 2)
+        s = pts.sum(axis=1)
+        d = pts[:, 1] - pts[:, 0]
+        
+        tl = pts[np.argmin(s)]
+        br = pts[np.argmax(s)]
+        tr = pts[np.argmin(d)]
+        bl = pts[np.argmax(d)]
+        target_corners = np.array([tl, tr, br, bl])
+
+    # Convert local crop coords to global
+    offset = np.array([bx1, by1], dtype=np.float32)
+    
+    # Re-order target_corners to TL, TR, BR, BL geometric order to match grid
+    target_corners = order_points_quad(target_corners)
+    
+    # Now find the indices of these corners in the ORIGINAL full contour (cnt)
+    # We want the dense contour for resampling, not the approx one.
+    cnt_global = cnt.reshape(-1, 2) + offset
+    target_corners_global = target_corners + offset
+    
+    corner_idxs = []
+    for corner in target_corners_global:
+        # Find closest point in cnt_global
+        dists = np.linalg.norm(cnt_global - corner, axis=1)
+        corner_idxs.append(np.argmin(dists))
+        
+    return cnt_global.astype(np.float32), corner_idxs
+
+
 def postprocess_grid(
     grid_xy: np.ndarray,
     bbox_xyxy: np.ndarray,
@@ -27,6 +249,7 @@ def postprocess_grid(
     outlier_sigma: float = 4.0,
     anchor_edges: bool = True,
     enforce_monotonic: bool = True,
+    border_info: tuple = None, # (contour, corner_idxs)
 ) -> np.ndarray:
     """
     Heuristic keypoint grid cleanup.
@@ -45,6 +268,23 @@ def postprocess_grid(
     # Normalize into bbox-local [0,1] for stable thresholds.
     g = (grid_xy - np.array([x1, y1], dtype=np.float32)) / np.array([bw, bh], dtype=np.float32)
     g = g.astype(np.float32)
+
+    # If border contour provided, pre-calculate the target boundary in normalized coords.
+    # We do this once to avoid drifting/jitter.
+    g_boundary_fixed = None
+    if border_info is not None:
+        contour, corner_idxs = border_info
+        # Denormalize current g to get corners for matching - wait, we don't need to match anymore
+        # We just snap to the identified contour corners
+        
+        # We need the base grid just to copy the inner points initially? 
+        # Actually snap_grid_to_contour modifies the boundary of the input grid.
+        g_abs = g * np.array([bw, bh], dtype=np.float32) + np.array([x1, y1], dtype=np.float32)
+        g_abs_snapped = snap_grid_to_contour(g_abs, contour, corner_idxs, n)
+        
+        # Re-normalize
+        g_snapped = (g_abs_snapped - np.array([x1, y1], dtype=np.float32)) / np.array([bw, bh], dtype=np.float32)
+        g_boundary_fixed = g_snapped.copy()
 
     eps = 1e-5
 
@@ -80,7 +320,13 @@ def postprocess_grid(
         g[:, :, 0] = np.clip(g[:, :, 0], -0.25, 1.25)
         g[:, :, 1] = np.clip(g[:, :, 1], -0.25, 1.25)
 
-        if anchor_edges:
+        if g_boundary_fixed is not None:
+            # Enforce the detected border
+            g[0, :, :] = g_boundary_fixed[0, :, :]
+            g[-1, :, :] = g_boundary_fixed[-1, :, :]
+            g[:, 0, :] = g_boundary_fixed[:, 0, :]
+            g[:, -1, :] = g_boundary_fixed[:, -1, :]
+        elif anchor_edges:
             # Anchor edges to extrema in the current grid (helps missing/incorrect border points).
             xmin = float(np.min(g[:, :, 0]))
             xmax = float(np.max(g[:, :, 0]))
@@ -232,7 +478,7 @@ def draw_lattice(img_bgr, grid_xy, color=(0, 0, 255), thickness=1):
 
 def main():
     ap = argparse.ArgumentParser(description="Infer UVDoc lattice and visualize dewarp animation")
-    ap.add_argument("--model", type=str, default="runs/pose/uvdoc_yolo11n/weights/best.pt", help="Path to YOLO pose weights")
+    ap.add_argument("--model", type=str, default="runs/pose/uvdoc_yolo11s_midstrong/weights/best.pt", help="Path to YOLO pose weights")
     ap.add_argument("--img", type=str, required=True, help="Input image path")
     ap.add_argument("--imgsz", type=int, default=640, help="Inference imgsz (Ultralytics handles resizing internally)")
     ap.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
@@ -246,6 +492,7 @@ def main():
     ap.add_argument("--post_sigma", type=float, default=4.0, help="Outlier threshold in MAD-sigma units")
     ap.add_argument("--no_anchor", action="store_true", help="Disable edge anchoring during post-processing")
     ap.add_argument("--no_mono", action="store_true", help="Disable monotonicity constraints during post-processing")
+    ap.add_argument("--no_border_detect", action="store_true", help="Disable document border detection for lattice anchoring")
     args = ap.parse_args()
 
     model_path = Path(args.model)
@@ -284,6 +531,15 @@ def main():
 
     grid_used = grid_pred
     if args.post:
+        # Detect border if requested
+        border_info = None
+        if not args.no_border_detect:
+            border_info = get_document_contour(img_bgr, xyxy)
+            if border_info is not None:
+                print("Document border detected.")
+            else:
+                print("Document border not detected, falling back to grid extrema.")
+        
         grid_used = postprocess_grid(
             grid_pred,
             xyxy,
@@ -291,6 +547,7 @@ def main():
             outlier_sigma=args.post_sigma,
             anchor_edges=(not args.no_anchor),
             enforce_monotonic=(not args.no_mono),
+            border_info=border_info,
         )
 
     # "Undistorted coordinates within border": normalize keypoints into bbox-local [0,1]
