@@ -1,3 +1,3 @@
-- add augmentation to unet training
-- add shading channel to unet training
+- add augmentation to unet training - Done
+- add shading channel to unet training - Done
 - add grid visual to vis_unet.py

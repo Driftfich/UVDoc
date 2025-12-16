@@ -4,3 +4,4 @@
 /dataset_unet/
 *.pt
 *.gif
+*.png
