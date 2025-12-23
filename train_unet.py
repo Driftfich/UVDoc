@@ -13,6 +13,28 @@ from torchvision import models, transforms
 from torchvision.models.feature_extraction import create_feature_extractor
 import matplotlib.pyplot as plt
 import albumentations as A
+from tqdm import tqdm
+
+# define weights
+w_mask = 1.0
+w_uv = 10.0
+w_grad = 5.0
+w_shading = 5.0
+w_structure = 10.0
+w_stiffness = 10.0
+w_tv_shading = 0
+w_rigidity = 10.0
+
+weights = {
+    "Mask": w_mask,
+    "UV": w_uv,
+    "Grad": w_grad,
+    "Shading": w_shading,
+    "Structure": w_structure,
+    "Stiffness": w_stiffness,
+    "TV": w_tv_shading,
+    "Rigid": w_rigidity
+}
 
 # --- 1. Dataset with CoordConv ---
 class UVDocUNetDataset(Dataset):
@@ -26,8 +48,8 @@ class UVDocUNetDataset(Dataset):
         self.transforms = transforms
         
         # Load Pre-computed Texture Edges and Sobel Targets
-        self.edge_map_dir = Path("downloads/UVDoc_final/texture_edges")
-        self.sobel_target_dir = Path("downloads/UVDoc_final/texture_sobel")
+        self.flat_edge_map = Path("downloads/UVDoc_final/flat_edges")
+        self.warped_edge_map = Path("downloads/UVDoc_final/warped_edges")
         
         # Precompute Coordinate Grids
         h, w = size
@@ -62,19 +84,17 @@ class UVDocUNetDataset(Dataset):
         
         if label_data.shape[-1] == 5:
             uv_map_gt = label_data[..., :2]
-            shading_gt = label_data[..., 2:] # BGR
-            shading_gt = shading_gt[..., ::-1].copy() # BGR -> RGB
+            shading_rgb = label_data[..., 2:] # BGR
+            shading_rgb = shading_rgb[..., ::-1].copy() # BGR -> RGB
+            # Convert to 1-channel luminance
+            # Note: shading_rgb is already float32 [0,1] from the .npy files
+            shading_gt = cv2.cvtColor(shading_rgb, cv2.COLOR_RGB2GRAY)[..., None]
         else:
             uv_map_gt = label_data
-            shading_gt = np.zeros((*uv_map_gt.shape[:2], 3), dtype=np.float32)
+            shading_gt = np.zeros((*uv_map_gt.shape[:2], 1), dtype=np.float32)
         
         # Target prep
         valid_mask = (uv_map_gt[..., 0] != -1).astype(np.float32)
-        
-        # Erode mask to remove border artifacts (e.g. green background from geometry images)
-        # 5x5 kernel removes ~2 pixels of border, which clears interpolation artifacts
-        # kernel = np.ones((5, 5), np.uint8)
-        # valid_mask = cv2.erode(valid_mask, kernel, iterations=1)
         
         uv_clean = uv_map_gt.copy()
         uv_clean[uv_clean == -1] = 0
@@ -82,35 +102,35 @@ class UVDocUNetDataset(Dataset):
         # Ensure shading is clean (masked)
         shading_gt = shading_gt * valid_mask[..., None]
 
-        # Load Sobel Target
-        sobel_target_path = self.sobel_target_dir / f"{img_id}.png"
-        if sobel_target_path.exists():
-            sobel_target = cv2.imread(str(sobel_target_path), cv2.IMREAD_GRAYSCALE)
-            sobel_target = sobel_target.astype(np.float32) / 255.0
+        # Load Flat Texture Canny Map
+        flat_canny_path = self.flat_edge_map / f"{img_id}.png"
+        if flat_canny_path.exists():
+            flat_canny = cv2.imread(str(flat_canny_path), cv2.IMREAD_GRAYSCALE)
+            flat_canny = flat_canny.astype(np.float32) / 255.0
         else:
-            sobel_target = np.zeros(self.size, dtype=np.float32)
+            flat_canny = np.zeros(self.size, dtype=np.float32)
 
-        # Load Texture Edge Map
-        tex_edge_map_path = self.edge_map_dir / f"{img_id}.png"
-        if tex_edge_map_path.exists():
-            tex_edge_map = cv2.imread(str(tex_edge_map_path), cv2.IMREAD_GRAYSCALE)
-            tex_edge_map = tex_edge_map.astype(np.float32) / 255.0
+        # Load Warped Texture Canny Map (Target)
+        warped_canny_path = self.warped_edge_map / f"{img_id}.png"
+        if warped_canny_path.exists():
+            warped_canny = cv2.imread(str(warped_canny_path), cv2.IMREAD_GRAYSCALE)
+            warped_canny = warped_canny.astype(np.float32) / 255.0
         else:
-            tex_edge_map = np.zeros(self.size, dtype=np.float32)
+            warped_canny = np.zeros(self.size, dtype=np.float32)
         
         # Resize if needed (safety check)
-        if sobel_target.shape != self.size:
-            sobel_target = cv2.resize(sobel_target, (self.size[1], self.size[0]))
-        if tex_edge_map.shape != self.size:
-            tex_edge_map = cv2.resize(tex_edge_map, (self.size[1], self.size[0]))
+        if flat_canny.shape != self.size:
+            flat_canny = cv2.resize(flat_canny, (self.size[1], self.size[0]))
+        if warped_canny.shape != self.size:
+            warped_canny = cv2.resize(warped_canny, (self.size[1], self.size[0]))
         
-        # Channels: 0,1=UV, 2=Mask, 3,4,5=Shading(RGB), 6=TextureEdge, 7=SobelTarget
+        # Channels: 0,1=UV, 2=Mask, 3=Shading(Luma), 4=FlatCanny, 5=WarpedCanny
         target = np.concatenate([
             uv_clean, 
             valid_mask[..., None], 
             shading_gt,
-            tex_edge_map[..., None],
-            sobel_target[..., None]
+            flat_canny[..., None],
+            warped_canny[..., None]
         ], axis=-1)
         
         # Apply Augmentations
@@ -146,8 +166,8 @@ class UpBlock(nn.Module):
         
     def forward(self, x, skip):
         x = self.up(x)
-        if x.shape[2:] != skip.shape[2:]:
-            x = transforms.functional.resize(x, size=skip.shape[2:])
+        if x.shape[2] != skip.shape[2] or x.shape[3] != skip.shape[3]:
+            x = F.interpolate(x, size=(skip.shape[2], skip.shape[3]), mode='bilinear', align_corners=True)
         x = torch.cat([x, skip], dim=1)
         return self.conv(x)
 
@@ -229,22 +249,22 @@ class SobelLayer(nn.Module):
         return mag
 
 class MobileNetV3UNet(nn.Module):
-    def __init__(self, num_classes=6): # U, V, Mask, R, G, B
+    def __init__(self, num_classes=4): # U, V, Mask, Shading (Luma)
         super().__init__()
         
         self.sobel = SobelLayer()
         
         backbone = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
         
-        # Modify first layer for 5 channels (CoordConv)
+        # Modify first layer for 6 channels (RGB + CoordConv + Sobel)
         # Original: Conv2d(3, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
         original_first_layer = backbone.features[0][0]
-        new_first_layer = nn.Conv2d(5, 16, kernel_size=3, stride=2, padding=1, bias=False)
+        new_first_layer = nn.Conv2d(6, 16, kernel_size=3, stride=2, padding=1, bias=False)
         
         # Initialize
         with torch.no_grad():
             new_first_layer.weight[:, :3, :, :] = original_first_layer.weight
-            # Init coord channels with small noise
+            # Init coord + sobel channels with kaiming
             nn.init.kaiming_normal_(new_first_layer.weight[:, 3:, :, :], mode='fan_out', nonlinearity='relu')
             
         backbone.features[0][0] = new_first_layer
@@ -280,24 +300,26 @@ class MobileNetV3UNet(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # 0. Precompute Edges (Feature Engineering)
-        edges = self.sobel(x) # (B, 1, H, W)
+        # 0. Precompute Edges (Feature Engineering) from RGB
+        edges = self.sobel(x[:, :3, :, :]) # (B, 1, H, W)
         
-        # Generate coordinate grid for the input resolution
+        # 1. Generate coordinate grid for the input resolution
         b, _, h, w = x.shape
-        xx_ones = torch.ones(h, w, dtype=torch.int32, device=x.device)
-        xx_range = torch.arange(w, dtype=torch.int32, device=x.device)
-        xx = xx_ones * xx_range[None, :]
-        yy_ones = torch.ones(h, w, dtype=torch.int32, device=x.device)
-        yy_range = torch.arange(h, dtype=torch.int32, device=x.device)
-        yy = yy_range[:, None] * yy_ones
+        xx_range = torch.linspace(-1, 1, w, device=x.device)
+        yy_range = torch.linspace(-1, 1, h, device=x.device)
+        yy, xx = torch.meshgrid(yy_range, xx_range, indexing='ij')
+        grid = torch.stack([xx, yy], dim=0) # (2, H, W)
+        grid = grid.unsqueeze(0).expand(b, -1, -1, -1)
         
-        xx = xx / (w - 1) * 2 - 1
-        yy = yy / (h - 1) * 2 - 1
-        grid = torch.stack([xx, yy], dim=0).float() # (2, H, W)
-        grid = grid.unsqueeze(0).repeat(b, 1, 1, 1)
-        
-        features = self.encoder(x)
+        # 2. Construct 6-channel input for Encoder: (RGB, CoordX, CoordY, Edges)
+        if x.shape[1] == 5:
+            # x already has RGB + CoordConv from Dataset
+            x_encoder = torch.cat([x, edges], dim=1)
+        else:
+            # Inference case or raw RGB
+            x_encoder = torch.cat([x, grid, edges], dim=1)
+            
+        features = self.encoder(x_encoder)
         e1 = features['layer1']
         e2 = features['layer2']
         e3 = features['layer3']
@@ -320,11 +342,17 @@ class MobileNetV3UNet(nn.Module):
 
 # --- 3. Loss with Gradients ---
 class GeometricLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, scales=None):
         super().__init__()
         self.l1 = nn.L1Loss(reduction='none')
         self.bce = nn.BCELoss()
         self.sobel = SobelLayer() # Use the differentiable layer we built
+        
+        # Default scales to 1.0 if not provided
+        self.scales = scales if scales is not None else {
+            "Mask": 1.0, "UV": 1.0, "Grad": 1.0, "Shading": 1.0, 
+            "Structure": 1.0, "Stiffness": 1.0, "TV": 1.0, "Rigid": 1.0
+        }
         
     def gradient_loss(self, pred_uv, target_uv, mask):
         # Dy: (B, 2, H-1, W)
@@ -373,25 +401,88 @@ class GeometricLoss(nn.Module):
         
         return loss_x + loss_y
 
+    def tv_shading_loss(self, shading, mask):
+        # Penalize neighboring pixel differences in shading (Total Variation)
+        # dh: (B, 1, H-1, W)
+        dh = torch.abs(shading[:, :, 1:, :] - shading[:, :, :-1, :])
+        # dw: (B, 1, H, W-1)
+        dw = torch.abs(shading[:, :, :, 1:] - shading[:, :, :, :-1])
+        
+        mask_h = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+        mask_w = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+        
+        loss_h = (dh * mask_h).sum() / (mask_h.sum() + 1e-6)
+        loss_w = (dw * mask_w).sum() / (mask_w.sum() + 1e-6)
+        
+        return loss_h + loss_w
+
+    def jacobian_rigidity_loss(self, pred_uv, mask):
+        # pred_uv: (B, 2, H, W)
+        # Calculates the Jacobian matrix elements: du/dx, du/dy, dv/dx, dv/dy
+        # We want the local transformation to be uniform (constant derivatives)
+        
+        du_dx = pred_uv[:, 0:1, :, 1:] - pred_uv[:, 0:1, :, :-1]
+        du_dy = pred_uv[:, 0:1, 1:, :] - pred_uv[:, 0:1, :-1, :]
+        dv_dx = pred_uv[:, 1:2, :, 1:] - pred_uv[:, 1:2, :, :-1]
+        dv_dy = pred_uv[:, 1:2, 1:, :] - pred_uv[:, 1:2, :-1, :]
+        
+        # Penalize variance of these derivatives in local neighborhoods
+        # A simple way is to take the 1st derivative of the 1st derivatives (which is 2nd derivative)
+        # but focused on the orthogonality.
+        # For simplicity and efficiency, we ensure du_dx == dv_dy and du_dy == -dv_dx (Cauchy-Riemann like)
+        # OR we just penalize high-frequency changes in these derivatives.
+        
+        # We'll use the "Rigidity" formulation: (du/dx - 1)^2 + (dv/dy - 1)^2 + (du/dy)^2 + (dv/dx)^2
+        # But since our UV is normalized 0-1, the "1" depends on resolution.
+        # Instead, we just penalize the difference between neighboring Jacobian elements.
+        
+        diff_u_x = du_dx[:, :, :, 1:] - du_dx[:, :, :, :-1]
+        diff_u_y = du_dy[:, :, 1:, :] - du_dy[:, :, :-1, :]
+        diff_v_x = dv_dx[:, :, :, 1:] - dv_dx[:, :, :, :-1]
+        diff_v_y = dv_dy[:, :, 1:, :] - dv_dy[:, :, :-1, :]
+        
+        m_x = mask[:, :, :, 2:] * mask[:, :, :, 1:-1] * mask[:, :, :, :-2]
+        m_y = mask[:, :, 2:, :] * mask[:, :, 1:-1, :] * mask[:, :, :-2, :]
+        
+        loss = (diff_u_x.abs() * m_x).mean() + (diff_u_y.abs() * m_y).mean() + \
+               (diff_v_x.abs() * m_x).mean() + (diff_v_y.abs() * m_y).mean()
+        
+        return loss
+
     def forward(self, pred, target, input_img):
         pred_uv = pred[:, :2, :, :]
         pred_mask = pred[:, 2, :, :]
-        pred_shading = pred[:, 3:, :, :]
+        pred_shading = pred[:, 3:4, :, :]
         
         target_uv = target[:, :2, :, :]
         target_mask = target[:, 2, :, :]
-        target_shading = target[:, 3:6, :, :]
-        target_weights = target[:, 6, :, :].unsqueeze(1) # (B, 1, H, W)
-        target_sobel = target[:, 7, :, :].unsqueeze(1)   # (B, 1, H, W)
+        target_shading = target[:, 3:4, :, :]
+        
+        # These are in FLAT domain (0..1 UV space)
+        # Channels: 0,1=UV, 2=Mask, 3=Shading(Luma), 4=FlatCanny, 5=WarpedCanny
+        flat_canny_map = target[:, 4, :, :].unsqueeze(1) # (B, 1, H, W)
+        warped_canny_map = target[:, 5, :, :].unsqueeze(1) # (B, 1, H, W)
         
         # 1. Mask Loss
         loss_mask = self.bce(pred_mask, target_mask)
         
         mask_expanded = target_mask.unsqueeze(1).repeat(1, 2, 1, 1)
         
+        # --- PREPARE GRIDS FOR SAMPLING ---
+        # Convert 0..1 UVs to -1..1 Grid coordinates for grid_sample
+        # GT UVs (for warping weights)
+        grid_gt = target_uv.permute(0, 2, 3, 1) * 2.0 - 1.0 # (B, H, W, 2)
+        # Pred UVs (for structural loss)
+        grid_pred = pred_uv.permute(0, 2, 3, 1) * 2.0 - 1.0 # (B, H, W, 2)
+        
+        
         # 2. Edge-Weighted UV L1 Loss
-        # Weights: 1.0 (base) + 5.0 * EdgeMap
-        edge_weights = 1.0 + 5.0 * target_weights
+        # FIX: Warp the Flat Canny Map to the Distorted Domain using GT UVs
+        # This aligns the weights with the actual pixels in the input image.
+        distorted_weights = F.grid_sample(flat_canny_map, grid_gt, align_corners=True, mode='bilinear', padding_mode='zeros')
+        
+        # Weights: 1.0 (base) + 5.0 * WarpedEdges
+        edge_weights = 1.0 + 5.0 * distorted_weights
         edge_weights_uv = edge_weights.repeat(1, 2, 1, 1)
         
         loss_uv = self.l1(pred_uv, target_uv)
@@ -416,41 +507,64 @@ class GeometricLoss(nn.Module):
         loss_grad_total = loss_grad_1 + loss_grad_2 + loss_grad_4
         
         # 4. Shading Loss
-        mask_expanded_shading = target_mask.unsqueeze(1).repeat(1, 3, 1, 1)
+        mask_expanded_shading = target_mask.unsqueeze(1)
         loss_shading = self.l1(pred_shading, target_shading)
         loss_shading = (loss_shading * mask_expanded_shading).sum() / (mask_expanded_shading.sum() + 1e-6)
         
-        # 5. Structural Loss (Strategy B) - Updated for Albedo
-        # Calculate Albedo to remove lighting/shadows before Sobel check
+        # 5. Structural Loss (Warped Canny Alignment)
+        # We now compare the warped version of the flat texture edges (from GT warped textures)
+        # against the flat texture edges sampled with the predicted UV map.
         
-        # Clamp shading to avoid div/0
-        shading_clamped = torch.clamp(pred_shading, 0.1, 1.0)
+        # A. Warped Canny Map (Static Target from dataset)
+        # This is already in the Distorted/Image Domain.
         
-        # Input is normalized 0-1. Albedo = Input / Shading
-        # input_img has 5 channels (RGB + XY), we need RGB
-        pred_albedo = input_img[:, :3, :, :] / shading_clamped
-        pred_albedo = torch.clamp(pred_albedo, 0, 1)
+        # B. Flat Canny sampled with Predicted UVs
+        # Uses Predicted UVs to "synthesize" what the warped edges should look like.
+        pred_warped_edges = F.grid_sample(flat_canny_map, grid_pred, align_corners=True, mode='bilinear')
         
-        # Prepare Grid (Sigmoid 0-1 -> Grid -1 to 1)
-        grid = pred_uv.permute(0, 2, 3, 1) # (B, H, W, 2)
-        grid = grid * 2.0 - 1.0
-        
-        # Differentiable Unwarp on ALBEDO
-        unwarped_albedo = F.grid_sample(pred_albedo, grid, align_corners=True)
-        
-        # Compute Sobel on Unwarped Albedo
-        sobel_pred = self.sobel(unwarped_albedo)
-        
-        # Loss: L1 distance between Predicted Albedo Structure and Target Structure
-        loss_structure = self.l1(sobel_pred, target_sobel)
-        # Use simple mask (1 channel) for structure loss
+        # Loss: Forces Predicted UVs to align the Flat Texture edges with the GT Warped Texture edges.
+        loss_structure = self.l1(pred_warped_edges, warped_canny_map)
         loss_structure = (loss_structure * target_mask.unsqueeze(1)).sum() / (target_mask.sum() + 1e-6)
         
         # 6. Stiffness (Curvature) Loss
         loss_stiffness = self.curvature_loss(pred_uv, mask_expanded)
+
+        # 7. TV Shading Loss
+        loss_tv_shading = self.tv_shading_loss(pred_shading, target_mask.unsqueeze(1))
         
-        # Weights: Mask=1.0, UV=10.0, Grad=5.0, Shading=5.0, Structure=5.0, Stiffness=10.0
-        return loss_mask + 10.0 * loss_uv + 5.0 * loss_grad_total + 5.0 * loss_shading + 5.0 * loss_structure + 10.0 * loss_stiffness
+        # 8. Jacobian Rigidity Loss (Fixes wobbly lines)
+        loss_rigidity = self.jacobian_rigidity_loss(pred_uv, target_mask.unsqueeze(1))
+
+        # print loss components
+        components = {
+            "Mask": loss_mask.item(),
+            "UV": loss_uv.item(),
+            "Grad": loss_grad_total.item(),
+            "Shading": loss_shading.item(),
+            "Structure": loss_structure.item(),
+            "Stiffness": loss_stiffness.item(),
+            "TV": loss_tv_shading.item(),
+            "Rigid": loss_rigidity.item()
+        }
+
+        total_weights = (w_mask + w_uv + w_grad + w_shading + 
+                         w_structure + w_stiffness + w_tv_shading + w_rigidity)
+
+        total_loss = (w_mask * self.scales["Mask"] * loss_mask + 
+                w_uv * self.scales["UV"] * loss_uv + 
+                w_grad * self.scales["Grad"] * loss_grad_total + 
+                w_shading * self.scales["Shading"] * loss_shading + 
+                w_structure * self.scales["Structure"] * loss_structure + 
+                w_stiffness * self.scales["Stiffness"] * loss_stiffness + 
+                w_tv_shading * self.scales["TV"] * loss_tv_shading +
+                w_rigidity * self.scales["Rigid"] * loss_rigidity) / total_weights
+        
+        debug_info = {
+            "pred_warped_edges": pred_warped_edges,
+            "warped_canny_map": warped_canny_map
+        }
+        
+        return total_loss, components, debug_info
 
 def get_train_transforms(args):
     return A.Compose([
@@ -464,6 +578,61 @@ def get_train_transforms(args):
         A.GaussNoise(std_range=(0.0, args.aug_noise_std), mean_range=(0.0, 0.0), p=args.aug_prob),
     ])
 
+def calibrate_loss_scales(model, train_loader, device, num_steps=1000):
+    """
+    Runs a warmup phase to compute scaling factors for each loss component.
+    """
+    import copy
+    print(f"Starting Calibration Phase ({num_steps} steps)...")
+    
+    # Use a copy of the model so calibration updates don't persist
+    temp_model = copy.deepcopy(model).to(device)
+    temp_model.train()
+    
+    optimizer = optim.AdamW(temp_model.parameters(), lr=1e-3)
+    # Use unscaled criterion for calibration
+    criterion = GeometricLoss(scales=None).to(device)
+    
+    sums = {}
+    count = 0
+    
+    pbar = tqdm(total=num_steps, desc="Calibrating")
+    
+    step = 0
+    while step < num_steps:
+        for imgs, targets in train_loader:
+            if step >= num_steps: break
+            
+            imgs, targets = imgs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            
+            preds = temp_model(imgs)
+            loss, components, _ = criterion(preds, targets, imgs)
+            
+            loss.backward()
+            optimizer.step()
+            
+            # Accumulate
+            for k, v in components.items():
+                sums[k] = sums.get(k, 0.0) + v
+            count += 1
+            
+            step += 1
+            pbar.update(1)
+            
+    pbar.close()
+    
+    # Compute scales: scale = 1.0 / mean_value
+    # This makes every scaled component roughly magnitude 1.0
+    means = {k: v / count for k, v in sums.items()}
+    scales = {k: 1.0 / (v + 1e-8) for k, v in means.items()}
+    
+    print("Calibration complete.")
+    # for k, v in means.items():
+    #     print(f"  {k}: {v:.6f} -> Scale: {scales[k]:.6f}")
+        
+    return scales
+
 def train_unet(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -474,14 +643,54 @@ def train_unet(args):
     train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=4)
     
-    model = MobileNetV3UNet(num_classes=6).to(device)
+    model = MobileNetV3UNet(num_classes=4).to(device)
+    
+    # --- 1. Calibration / Scaling ---
+    import json
+    scales_path = Path(args.scales_file)
+    
+    if args.calibrate or not scales_path.exists():
+        scales = calibrate_loss_scales(model, train_loader, device, num_steps=1000)
+        with open(scales_path, 'w') as f:
+            json.dump(scales, f, indent=4)
+        print(f"Saved scales to {scales_path}")
+    else:
+        with open(scales_path, 'r') as f:
+            scales = json.load(f)
+        print(f"Loaded scales from {scales_path}")
+
+    for k, v in scales.items():
+        print(f"  {k}: {v:.6f} -> Factor: {v:.6f}")
+    for k, v in weights.items():
+        print(f"  {k}: {v:.6f} -> Weight: {v:.6f}")
+    for k, v in weights.items():
+        print(f"  {k}: {v:.6f} -> Scale: {scales[k] * weights[k]:.6f}")
+        
+
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-    criterion = GeometricLoss().to(device)
+    criterion = GeometricLoss(scales=scales).to(device)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3)
     
+    print("------ Dataset Info ------\n" \
+        f"Train Size: {len(train_ds)}\n" \
+        f"Val Size: {len(val_ds)}\n" \
+        "------ Training Config ------\n" \
+        f"Batch Size: {args.batch}\n" \
+        f"Log Interval: {args.log_interval}\n" \
+        f"Augment Prob: {args.aug_prob}\n" \
+        f"Augment Color: {args.aug_color}\n" \
+        f"Augment Noise Std: {args.aug_noise_std}\n" \
+        )
     print(f"Training for {args.epochs} epochs with CoordConv + Gradient Loss...")
     best_val = float('inf')
     
+    global_step = 0
+    accumulated_components = {}
+
+    if args.verbose:
+        verbose_dir = Path(args.verbose_dir)
+        verbose_dir.mkdir(parents=True, exist_ok=True)
+
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0
@@ -492,11 +701,48 @@ def train_unet(args):
             
             # 1. Main Forward Pass
             preds = model(imgs)
-            loss = criterion(preds, targets, imgs)
+            loss, components, debug_info = criterion(preds, targets, imgs)
             
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
+            
+            # Accumulate components
+            for k, v in components.items():
+                accumulated_components[k] = accumulated_components.get(k, 0.0) + v
+            
+            global_step += 1
+            if global_step % args.log_interval == 0:
+                avg_comp = {k: v / args.log_interval for k, v in accumulated_components.items()}
+                log_str = " | ".join([f"{k}: {v:.4f}" for k, v in avg_comp.items()])
+                print(f"Step {global_step} | {log_str}")
+                accumulated_components = {}
+                
+                # Verbose Visualization
+                if args.verbose:
+                    # Take first sample from batch
+                    pred_edges = debug_info["pred_warped_edges"][0, 0].detach().cpu().numpy()
+                    gt_edges = debug_info["warped_canny_map"][0, 0].detach().cpu().numpy()
+                    mask = targets[0, 2].detach().cpu().numpy() # Document Mask
+                    
+                    # Create RGB image: Red = Prediction, Blue = Ground Truth
+                    h, w = pred_edges.shape
+                    vis = np.zeros((h, w, 3), dtype=np.uint8)
+                    
+                    # Apply mask to edges so we only see the document area
+                    pred_edges_masked = pred_edges * mask
+                    gt_edges_masked = gt_edges * mask
+                    
+                    vis[..., 0] = (pred_edges_masked * 255).astype(np.uint8) # Red
+                    vis[..., 2] = (gt_edges_masked * 255).astype(np.uint8)   # Blue
+                    
+                    # Overlap channel (Green) to show magenta where they align
+                    # This makes alignment much more obvious
+                    overlap = np.minimum(pred_edges_masked, gt_edges_masked)
+                    vis[..., 1] = (overlap * 255).astype(np.uint8)
+                    
+                    save_path = verbose_dir / f"step_{global_step:06d}.png"
+                    cv2.imwrite(str(save_path), cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
             
         train_loss /= len(train_loader)
         
@@ -506,7 +752,7 @@ def train_unet(args):
             for imgs, targets in val_loader:
                 imgs, targets = imgs.to(device), targets.to(device)
                 preds = model(imgs)
-                loss = criterion(preds, targets, imgs)
+                loss, _, _ = criterion(preds, targets, imgs)
                 val_loss += loss.item()
         
         val_loss /= len(val_loader)
@@ -524,12 +770,17 @@ def train_unet(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default="dataset_unet")
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--aug_prob", type=float, default=0.5, help="Probability of applying augmentation")
     parser.add_argument("--aug_color", type=float, default=0.2, help="Strength of color jitter")
     parser.add_argument("--aug_noise_std", type=float, default=0.2, help="Max standard deviation for Gaussian noise (0-1 range)")
+    parser.add_argument("--log_interval", type=int, default=1000, help="Interval for printing accumulated loss components")
+    parser.add_argument("--calibrate", action='store_true', help="Force run calibration phase")
+    parser.add_argument("--scales_file", default="loss_scales.json", help="Path to save/load loss scaling factors")
+    parser.add_argument("--verbose", action='store_true', help="Enable verbose visualization during training")
+    parser.add_argument("--verbose_dir", default="train_vis_debug", help="Directory to save verbose visualization images")
     args = parser.parse_args()
     
     train_unet(args)

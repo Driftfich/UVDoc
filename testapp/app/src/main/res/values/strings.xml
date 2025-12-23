@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">UVDoc App</string>
+    <string name="take_photo">Take Photo</string>
+    <string name="load_image">Load Image</string>
+    <string name="process">Process</string>
+</resources>
+

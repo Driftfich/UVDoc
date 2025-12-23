@@ -214,10 +214,12 @@ def infer_high_res(model, img_path, device='cpu', num_points=2500, method='gridd
     
     uv_pred_low = pred[..., :2]
     mask_pred_low = pred[..., 2]
-    shading_pred_low = pred[..., 3:]
+    shading_pred_low = pred[..., 3:4] # 1 channel luma
     
     # Resize shading to original resolution
     shading_high = cv2.resize(shading_pred_low, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
+    if shading_high.ndim == 2:
+        shading_high = shading_high[..., None]
     
     # Mask shading with predicted mask (upscaled) to remove background artifacts
     mask_pred_high = cv2.resize(mask_pred_low, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
@@ -236,12 +238,20 @@ def infer_high_res(model, img_path, device='cpu', num_points=2500, method='gridd
     kernel = np.ones((9, 9), np.uint8)
     mask_pred_bin_eroded = cv2.erode(mask_pred_bin, kernel, iterations=1)
     
+    # Apply mask to shading
     shading_high = shading_high * mask_pred_bin_eroded[..., None]
     shading_high = np.clip(shading_high, 0.05, 1.0) 
-    
+
     # Prepare Albedo
     img_float = img_orig.astype(np.float32) / 255.0 # RGB 0-1
-    albedo = img_float / shading_high
+    
+    # Smooth shading slightly to remove remaining model jitter
+    shading_final = cv2.GaussianBlur(shading_high, (15, 15), 0)
+    if shading_final.ndim == 2:
+        shading_final = shading_final[..., None]
+    
+    # Calculate Albedo (Broadcasting RGB / Luma)
+    albedo = img_float / shading_final
     albedo = np.clip(albedo, 0, 1)
     
     # 5. Backward Map Generation
@@ -371,7 +381,7 @@ def visualize_results(model_path, data_dir, raw_dir, out_dir, num_samples=3, dev
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    model = MobileNetV3UNet(num_classes=6)
+    model = MobileNetV3UNet(num_classes=4)
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))
     except FileNotFoundError:
@@ -413,8 +423,10 @@ def visualize_results(model_path, data_dir, raw_dir, out_dir, num_samples=3, dev
             albedo_disp = cv2.resize(albedo, (new_w, h))
             fwd_warp_disp = cv2.resize(fwd_warp, (new_w, h))
             
-            shading_disp = (shading * 255).astype(np.uint8)
+            shading_disp = (shading.squeeze(-1) * 255).astype(np.uint8)
             shading_disp = cv2.resize(shading_disp, (w, h))
+            # Convert grayscale to RGB for stacking
+            shading_disp = cv2.cvtColor(shading_disp, cv2.COLOR_GRAY2RGB)
             
             def add_label(img, text):
                 img = img.astype(np.uint8).copy()

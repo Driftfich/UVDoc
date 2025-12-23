@@ -5,3 +5,17 @@
 *.pt
 *.gif
 *.png
+*.pth
+/export_output/
+/testapp/.idea/
+/.idea/
+/testapp/.gradle/
+/testapp/gradle/
+/testapp/app/build/
+/testapp/build/
+/testapp/app/src/main/assets/
+*.bat
+*.hprof
+gradlew
+local.properties
+settings.gradle.kts

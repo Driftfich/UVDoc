@@ -43,7 +43,7 @@ def export_to_onnx(model, output_path, input_shape):
         opset_version=13, # 13 is usually safe for TFLite
         input_names=['input'],
         output_names=['output'],
-        dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+        dynamic_axes=None # Use fixed batch size for better TFLite compatibility
     )
     print("ONNX export complete.")
 
@@ -59,6 +59,7 @@ def convert_onnx_to_tf(onnx_path, tf_output_dir):
         "onnx2tf",
         "-i", onnx_path,
         "-o", tf_output_dir,
+        "--copy_onnx_input_output_names_to_tflite",
         "--non_verbose" 
     ]
     
@@ -74,6 +75,13 @@ def convert_tf_to_tflite(tf_model_dir, output_path, quantization):
     print(f"Converting SavedModel to TFLite (Quantization: {quantization})...")
     
     converter = tf.lite.TFLiteConverter.from_saved_model(tf_model_dir)
+    
+    # Enable Flex ops (TF Select) as some complex ops or dynamic shapes
+    # might not be supported natively by TFLite.
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS, # enable TFLite ops.
+        tf.lite.OpsSet.SELECT_TF_OPS # enable TF ops.
+    ]
     
     if quantization == 'fp16':
         converter.optimizations = [tf.lite.Optimize.DEFAULT]

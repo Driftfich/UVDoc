@@ -6,77 +6,72 @@ from pathlib import Path
 from tqdm import tqdm
 import orjson
 
-def compute_maps(tex_path, target_size=(256, 256)):
+def compute_canny_map(img_path, target_size=(256, 256), is_warped=False):
     """
-    Computes both Structural Weight Map (Morph+Canny) and Sobel Target (Gradient).
+    Computes a Distance Transform map from Canny edges.
+    If is_warped=True, it suppresses edges at the document boundary.
     """
     try:
-        if not tex_path.exists():
-            return None, None
+        if not img_path.exists():
+            return None
             
-        tex = cv2.imread(str(tex_path), cv2.IMREAD_GRAYSCALE)
-        if tex is None:
-            return None, None
+        img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return None
             
         # Resize to target size
-        tex_resized = cv2.resize(tex, (target_size[1], target_size[0]))
+        img_resized = cv2.resize(img, (target_size[1], target_size[0]))
         
-        # --- 1. Weight Map (Morphological Lines) ---
-        # Invert so text is bright
-        tex_inv = cv2.bitwise_not(tex_resized)
-        _, bin_tex = cv2.threshold(tex_inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 1. Canny Edges
+        blurred = cv2.GaussianBlur(img_resized, (3, 3), 0)
+        edges = cv2.Canny(blurred, 50, 150)
         
-        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 1))
-        lines_h = cv2.morphologyEx(bin_tex, cv2.MORPH_CLOSE, kernel_h)
-        edges_h = cv2.Canny(lines_h, 50, 150)
+        # 2. Boundary Suppression (Only for warped textures)
+        if is_warped:
+            # Create a mask of the document (where it's not black)
+            _, mask = cv2.threshold(img_resized, 10, 255, cv2.THRESH_BINARY)
+            # Erode the mask to ignore the outermost edges of the paper
+            kernel = np.ones((5, 5), np.uint8)
+            mask_eroded = cv2.erode(mask, kernel, iterations=2)
+            # Remove edges that fall on the boundary
+            edges = cv2.bitwise_and(edges, mask_eroded)
+
+        # 3. Distance Transform
+        dist = cv2.distanceTransform(cv2.bitwise_not(edges), cv2.DIST_L2, 5)
         
-        kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 20))
-        lines_v = cv2.morphologyEx(bin_tex, cv2.MORPH_CLOSE, kernel_v)
-        edges_v = cv2.Canny(lines_v, 50, 150)
-        
-        edges_img = cv2.Canny(tex_resized, 100, 200)
-        
-        combined_edges = cv2.bitwise_or(edges_h, edges_v)
-        combined_edges = cv2.bitwise_or(combined_edges, edges_img)
-        
-        dist = cv2.distanceTransform(cv2.bitwise_not(combined_edges), cv2.DIST_L2, 5)
+        # 4. Gaussian-like falloff
         weight_map = np.exp(-0.2 * dist).astype(np.float32)
         
-        # --- 2. Sobel Target (Visual Structure) ---
-        # Standard Sobel Magnitude
-        gx = cv2.Sobel(tex_resized, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(tex_resized, cv2.CV_32F, 0, 1, ksize=3)
-        mag = cv2.magnitude(gx, gy)
-        sobel_map = cv2.normalize(mag, None, 0, 1, cv2.NORM_MINMAX).astype(np.float32)
-        
-        return weight_map, sobel_map
+        return weight_map
         
     except Exception as e:
-        print(f"Error computing edges for {tex_path}: {e}")
-        return None, None
+        print(f"Error computing Canny for {img_path}: {e}")
+        return None
 
 def generate_edge_maps(raw_dir: Path):
     src_meta_dir = raw_dir / "metadata_sample"
     src_tex_dir = raw_dir / "textures"
+    src_warped_dir = raw_dir / "warped_textures"
     
-    dest_weight_dir = raw_dir / "texture_edges" # Weights
-    dest_sobel_dir = raw_dir / "texture_sobel" # Targets
+    dest_flat_dir = raw_dir / "flat_edges" # Flat Canny (Source)
+    dest_warped_dir = raw_dir / "warped_edges" # Warped Canny (Target)
     
-    dest_weight_dir.mkdir(exist_ok=True, parents=True)
-    dest_sobel_dir.mkdir(exist_ok=True, parents=True)
+    dest_flat_dir.mkdir(exist_ok=True, parents=True)
+    dest_warped_dir.mkdir(exist_ok=True, parents=True)
     
     meta_files = list(src_meta_dir.glob("*.json"))
     print(f"Found {len(meta_files)} metadata files.")
     
-    texture_cache = {}
+    # Cache for flat textures (since many samples share the same texture)
+    flat_cache = {}
     
     for meta_path in tqdm(meta_files, desc="Generating Maps"):
         img_id = meta_path.stem
         
-        dest_weight_path = dest_weight_dir / f"{img_id}.png"
-        dest_sobel_path = dest_sobel_dir / f"{img_id}.png"
+        dest_flat_path = dest_flat_dir / f"{img_id}.png"
+        dest_warped_path = dest_warped_dir / f"{img_id}.png"
         
-        if dest_weight_path.exists() and dest_sobel_path.exists():
+        if dest_flat_path.exists() and dest_warped_path.exists():
             continue
             
         try:
@@ -85,23 +80,30 @@ def generate_edge_maps(raw_dir: Path):
         except:
             continue
             
+        # 1. Process Flat Texture
         tex_rel_path = meta.get("texture_name")
         if not tex_rel_path:
             continue
             
         tex_name = Path(tex_rel_path).name
         
-        if tex_name in texture_cache:
-            weight_map, sobel_map = texture_cache[tex_name]
+        if tex_name in flat_cache:
+            flat_map = flat_cache[tex_name]
         else:
             tex_path = src_tex_dir / tex_name
-            weight_map, sobel_map = compute_maps(tex_path)
-            if weight_map is not None:
-                texture_cache[tex_name] = (weight_map, sobel_map)
+            flat_map = compute_canny_map(tex_path)
+            if flat_map is not None:
+                flat_cache[tex_name] = flat_map
         
-        if weight_map is not None:
-            cv2.imwrite(str(dest_weight_path), (weight_map * 255).astype(np.uint8))
-            cv2.imwrite(str(dest_sobel_path), (sobel_map * 255).astype(np.uint8))
+        # 2. Process Warped Texture
+        warped_path = src_warped_dir / f"{img_id}.png"
+        warped_map = compute_canny_map(warped_path, is_warped=True)
+        
+        # 3. Save
+        if flat_map is not None:
+            cv2.imwrite(str(dest_flat_path), (flat_map * 255).astype(np.uint8))
+        if warped_map is not None:
+            cv2.imwrite(str(dest_warped_path), (warped_map * 255).astype(np.uint8))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

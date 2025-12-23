@@ -1,7 +1,20 @@
-onnx
-onnx2tf
-tensorflow
+# Core ML Frameworks
 torch
 torchvision
 numpy
+tensorflow==2.20.0
+tf-keras
+
+# Export Tools
+onnx==1.16.1
+onnxsim==0.4.36
+onnx2tf==1.28.6
+onnx-graphsurgeon==0.5.8
+ai-edge-litert==2.1.0
+
+# ONNX Processing Tools (required by onnx2tf)
+sng4onnx==1.0.4
+simple-onnx-processing-tools==1.1.32
+
+# Training/Augmentation
 albumentations
