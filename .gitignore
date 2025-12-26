@@ -5,7 +5,6 @@
 *.pt
 *.gif
 *.png
-*.pth
 /export_output/
 /testapp/.idea/
 /.idea/

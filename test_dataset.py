@@ -29,19 +29,18 @@ def visualize_dataset(data_dir, split, n_samples, args=None):
         # It was normalized / 255.0 in dataset.
         
         # Process Target: (6, H, W) -> (H, W, C)
-        # 0,1: UV
-        # 2: Mask
-        # 3,4,5: Shading (RGB)
+        # Channels: 0,1=UV, 2=Mask, 3=Shading(Luma), 4=FlatCanny, 5=WarpedCanny
         target = target_tensor.permute(1, 2, 0).numpy()
         
         uv_map = target[..., :2]
         mask = target[..., 2]
-        shading = target[..., 3:]
+        shading = target[..., 3:4]
+        flat_canny = target[..., 4]
+        warped_canny = target[..., 5]
         
         # Visualize UV Map (encoded as colors for visibility)
-        # U -> Red/Green, V -> Blue? Or just show U and V separately?
         # Standard UV visualization: Red=U, Green=V, Blue=0
-        uv_vis = np.zeros_like(shading)
+        uv_vis = np.zeros((*shading.shape[:2], 3), dtype=np.float32)
         uv_vis[..., 0] = uv_map[..., 0]
         uv_vis[..., 1] = uv_map[..., 1]
         
@@ -52,15 +51,16 @@ def visualize_dataset(data_dir, split, n_samples, args=None):
         albedo = np.clip(albedo, 0, 1)
         
         # Mask Albedo/Shading/UV with the validity mask
-        # Also mask out where shading is very dark (background)
-        valid_mask = (mask > 0.5) & (np.mean(shading, axis=2) > 0.05)
+        valid_mask = (mask > 0.5)
         
         uv_vis[~valid_mask] = 0
-        shading[~valid_mask] = 0
+        shading_vis = shading.copy()
+        shading_vis[~valid_mask] = 0
         albedo[~valid_mask] = 0
         
         # Plot
-        fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+        axes = axes.flatten()
         
         axes[0].imshow(np.clip(img, 0, 1))
         axes[0].set_title("Input Image")
@@ -74,13 +74,25 @@ def visualize_dataset(data_dir, split, n_samples, args=None):
         axes[2].set_title("GT Mask")
         axes[2].axis('off')
         
-        axes[3].imshow(np.clip(shading, 0, 1))
-        axes[3].set_title("GT Shading")
+        axes[3].imshow(np.clip(shading_vis[..., 0], 0, 1), cmap='gray')
+        axes[3].set_title("GT Shading (Luma)")
         axes[3].axis('off')
         
-        axes[4].imshow(np.clip(albedo, 0, 1))
-        axes[4].set_title("Derived Albedo (Img/Shading)")
+        axes[4].imshow(flat_canny, cmap='magma')
+        axes[4].set_title("Flat Canny Map")
         axes[4].axis('off')
+        
+        axes[5].imshow(warped_canny, cmap='magma')
+        axes[5].set_title("Warped Canny Map")
+        axes[5].axis('off')
+        
+        axes[6].imshow(np.clip(albedo, 0, 1))
+        axes[6].set_title("Derived Albedo")
+        axes[6].axis('off')
+        
+        # Combined Canny Visualization (Red=Flat sampled? No, just overlap)
+        # We can't easily show overlap here without warping, but we can show them side by side.
+        axes[7].axis('off') # Placeholder
         
         out_path = f"test_sample_{i}_{split}.png"
         plt.tight_layout()

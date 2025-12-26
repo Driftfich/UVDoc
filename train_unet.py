@@ -16,14 +16,14 @@ import albumentations as A
 from tqdm import tqdm
 
 # define weights
-w_mask = 1.0
-w_uv = 10.0
-w_grad = 5.0
-w_shading = 5.0
-w_structure = 10.0
-w_stiffness = 10.0
-w_tv_shading = 0
-w_rigidity = 10.0
+w_mask = 1.0 # Document Mask Loss
+w_uv = 10.0 # UV + Canny Edge Loss => Dewarping and Edge Alignment Loss
+w_grad = 4.0 # Gradient Loss => Forces similar gradient in the GT and Predicted UV Map => Smoothness Loss
+w_shading = 8.0 # Shading Loss
+w_structure = 8.0 # Structural Loss => Edge Reprojection Alignment
+w_stiffness = 2.0 # Stiffness Loss => Paper Curvature Assumption
+w_tv_shading = 0 # TV Shading Loss => Shading Smoothness Loss
+w_rigidity = 2.0 # Jacobian Rigidity Loss => Local Uniformity in the Predicted UV Map => Wobbly Lines Fix
 
 weights = {
     "Mask": w_mask,
@@ -82,9 +82,9 @@ class UVDocUNetDataset(Dataset):
         mask_path = self.masks_dir / f"{img_id}.npy"
         label_data = np.load(str(mask_path)) # (H, W, 5) or (H, W, 2)
         
-        if label_data.shape[-1] == 5:
+        if label_data.shape[-1] >= 5:
             uv_map_gt = label_data[..., :2]
-            shading_rgb = label_data[..., 2:] # BGR
+            shading_rgb = label_data[..., 2:5] # BGR
             shading_rgb = shading_rgb[..., ::-1].copy() # BGR -> RGB
             # Convert to 1-channel luminance
             # Note: shading_rgb is already float32 [0,1] from the .npy files
@@ -477,12 +477,11 @@ class GeometricLoss(nn.Module):
         
         
         # 2. Edge-Weighted UV L1 Loss
-        # FIX: Warp the Flat Canny Map to the Distorted Domain using GT UVs
+        # We use the precomputed synthetic warped edges as weights.
         # This aligns the weights with the actual pixels in the input image.
-        distorted_weights = F.grid_sample(flat_canny_map, grid_gt, align_corners=True, mode='bilinear', padding_mode='zeros')
         
         # Weights: 1.0 (base) + 5.0 * WarpedEdges
-        edge_weights = 1.0 + 5.0 * distorted_weights
+        edge_weights = 1.0 + 5.0 * warped_canny_map
         edge_weights_uv = edge_weights.repeat(1, 2, 1, 1)
         
         loss_uv = self.l1(pred_uv, target_uv)
@@ -512,17 +511,12 @@ class GeometricLoss(nn.Module):
         loss_shading = (loss_shading * mask_expanded_shading).sum() / (mask_expanded_shading.sum() + 1e-6)
         
         # 5. Structural Loss (Warped Canny Alignment)
-        # We now compare the warped version of the flat texture edges (from GT warped textures)
-        # against the flat texture edges sampled with the predicted UV map.
+        # Forces Predicted UVs to align the Flat Texture edges with the GT Warped Texture edges.
+        # Since we precompute the synthetic target in generate_edges.py, 
+        # this loss is now noise-free and can reach 0.
         
-        # A. Warped Canny Map (Static Target from dataset)
-        # This is already in the Distorted/Image Domain.
-        
-        # B. Flat Canny sampled with Predicted UVs
-        # Uses Predicted UVs to "synthesize" what the warped edges should look like.
         pred_warped_edges = F.grid_sample(flat_canny_map, grid_pred, align_corners=True, mode='bilinear')
         
-        # Loss: Forces Predicted UVs to align the Flat Texture edges with the GT Warped Texture edges.
         loss_structure = self.l1(pred_warped_edges, warped_canny_map)
         loss_structure = (loss_structure * target_mask.unsqueeze(1)).sum() / (target_mask.sum() + 1e-6)
         
