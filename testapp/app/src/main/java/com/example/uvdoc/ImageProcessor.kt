@@ -16,7 +16,7 @@ class ImageProcessor(context: Context) {
     // Model dims
     private val INPUT_SIZE = 256
     private val NUM_INPUT_CHANNELS = 5 // R, G, B, X, Y
-    private val NUM_OUTPUT_CHANNELS = 6 // U, V, Mask, R_sh, G_sh, B_sh
+    private val NUM_OUTPUT_CHANNELS = 4 // U, V, Mask, Shading (Luma)
 
     init {
         try {
@@ -254,20 +254,17 @@ class ImageProcessor(context: Context) {
         val uMap = FloatArray(INPUT_SIZE * INPUT_SIZE)
         val vMap = FloatArray(INPUT_SIZE * INPUT_SIZE)
         val maskMap = FloatArray(INPUT_SIZE * INPUT_SIZE)
-        val shadingMap = FloatArray(INPUT_SIZE * INPUT_SIZE * 3)
+        val shadingMap = FloatArray(INPUT_SIZE * INPUT_SIZE)
 
         for (i in 0 until INPUT_SIZE * INPUT_SIZE) {
             uMap[i] = outputBuffer.float
             vMap[i] = outputBuffer.float
             maskMap[i] = outputBuffer.float
-            shadingMap[i * 3 + 0] = outputBuffer.float
-            shadingMap[i * 3 + 1] = outputBuffer.float
-            shadingMap[i * 3 + 2] = outputBuffer.float
+            shadingMap[i] = outputBuffer.float
         }
 
-        // Smooth shading (lighting is low-frequency) similar to vis_unet.py's GaussianBlur on shading_high
-        val shadingSmoothed = gaussianBlur3ch(shadingMap, INPUT_SIZE, INPUT_SIZE, radius = 4, sigma = 2.5f)
-        val colorCorrectFactor = 0.3f
+        // Smooth shading (lighting is low-frequency)
+        val shadingSmoothed = gaussianBlur1ch(shadingMap, INPUT_SIZE, INPUT_SIZE, radius = 4, sigma = 2.5f)
         val strength = shadingStrength.coerceIn(0f, 1f)
 
         // 5. Select Control Points for TPS
@@ -370,7 +367,7 @@ class ImageProcessor(context: Context) {
         
         // Helper to sample Shading Map (Input 256x256)
         // We need shading at SOURCE coordinates to compute Albedo
-        fun sampleShading(sxNorm: Float, syNorm: Float): FloatArray {
+        fun sampleShading(sxNorm: Float, syNorm: Float): Float {
              val gx = sxNorm * (INPUT_SIZE - 1)
              val gy = syNorm * (INPUT_SIZE - 1)
              
@@ -379,25 +376,15 @@ class ImageProcessor(context: Context) {
              val dx = gx - x0
              val dy = gy - y0
              
-             val rgb = FloatArray(3)
-             for (c in 0..2) {
-                 val idx00 = (y0 * INPUT_SIZE + x0) * 3 + c
-                 val idx10 = (y0 * INPUT_SIZE + x0 + 1) * 3 + c
-                 val idx01 = ((y0 + 1) * INPUT_SIZE + x0) * 3 + c
-                 val idx11 = ((y0 + 1) * INPUT_SIZE + x0 + 1) * 3 + c
-                 
-                 rgb[c] = shadingSmoothed[idx00] * (1 - dx) * (1 - dy) +
-                          shadingSmoothed[idx10] * dx * (1 - dy) +
-                          shadingSmoothed[idx01] * (1 - dx) * dy +
-                          shadingSmoothed[idx11] * dx * dy
-             }
-
-             // Luminance mix (color preservation) similar to vis_unet.py
-             val lum = (rgb[0] + rgb[1] + rgb[2]) / 3f
-             rgb[0] = (1f - colorCorrectFactor) * lum + colorCorrectFactor * rgb[0]
-             rgb[1] = (1f - colorCorrectFactor) * lum + colorCorrectFactor * rgb[1]
-             rgb[2] = (1f - colorCorrectFactor) * lum + colorCorrectFactor * rgb[2]
-             return rgb
+             val val00 = shadingSmoothed[y0 * INPUT_SIZE + x0]
+             val val10 = shadingSmoothed[y0 * INPUT_SIZE + x0 + 1]
+             val val01 = shadingSmoothed[(y0 + 1) * INPUT_SIZE + x0]
+             val val11 = shadingSmoothed[(y0 + 1) * INPUT_SIZE + x0 + 1]
+             
+             return val00 * (1 - dx) * (1 - dy) +
+                    val10 * dx * (1 - dy) +
+                    val01 * (1 - dx) * dy +
+                    val11 * dx * dy
         }
 
         val finalW = targetW
@@ -430,14 +417,13 @@ class ImageProcessor(context: Context) {
                     // 3. Sample Shading at Source Location (to get Albedo)
                     val shading = sampleShading(srcPt.x.coerceIn(0f, 1f), srcPt.y.coerceIn(0f, 1f))
                     // Apply user strength: 0 -> no correction (denominator=1), 1 -> full correction (denominator=shading)
-                    val dR = ((1f - strength) * 1f + strength * shading[0]).coerceAtLeast(0.05f)
-                    val dG = ((1f - strength) * 1f + strength * shading[1]).coerceAtLeast(0.05f)
-                    val dB = ((1f - strength) * 1f + strength * shading[2]).coerceAtLeast(0.05f)
+                    // Shading is expected to be ~1.0 for neutral lighting, <1 for shadows.
+                    val d = ((1f - strength) * 1f + strength * shading).coerceAtLeast(0.05f)
                     
                     // 4. Calculate Albedo
-                    var aR = r / dR
-                    var aG = g / dG
-                    var aB = b / dB
+                    var aR = r / d
+                    var aG = g / d
+                    var aB = b / d
                     
                     // Simple white balance / clip
                     aR = aR.coerceIn(0f, 1f)
@@ -460,7 +446,7 @@ class ImageProcessor(context: Context) {
         return finalBmp
     }
 
-    private fun gaussianBlur3ch(src: FloatArray, w: Int, h: Int, radius: Int, sigma: Float): FloatArray {
+    private fun gaussianBlur1ch(src: FloatArray, w: Int, h: Int, radius: Int, sigma: Float): FloatArray {
         if (radius <= 0) return src
 
         val size = radius * 2 + 1
@@ -474,32 +460,28 @@ class ImageProcessor(context: Context) {
         for (i in kernel.indices) kernel[i] /= sum
 
         // Horizontal pass
-        val tmp = FloatArray(w * h * 3)
+        val tmp = FloatArray(w * h)
         for (y in 0 until h) {
             for (x in 0 until w) {
-                for (c in 0..2) {
                     var acc = 0f
                     for (k in -radius..radius) {
                         val xx = (x + k).coerceIn(0, w - 1)
-                        acc += src[(y * w + xx) * 3 + c] * kernel[k + radius]
-                    }
-                    tmp[(y * w + x) * 3 + c] = acc
+                    acc += src[y * w + xx] * kernel[k + radius]
                 }
+                tmp[y * w + x] = acc
             }
         }
 
         // Vertical pass
-        val out = FloatArray(w * h * 3)
+        val out = FloatArray(w * h)
         for (y in 0 until h) {
             for (x in 0 until w) {
-                for (c in 0..2) {
                     var acc = 0f
                     for (k in -radius..radius) {
                         val yy = (y + k).coerceIn(0, h - 1)
-                        acc += tmp[(yy * w + x) * 3 + c] * kernel[k + radius]
-                    }
-                    out[(y * w + x) * 3 + c] = acc
+                    acc += tmp[yy * w + x] * kernel[k + radius]
                 }
+                out[y * w + x] = acc
             }
         }
         return out

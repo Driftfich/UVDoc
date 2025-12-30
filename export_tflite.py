@@ -124,7 +124,7 @@ def main():
     # 1. Load PyTorch Model
     print("Loading PyTorch model...")
     device = torch.device('cpu')
-    model = MobileNetV3UNet(num_classes=6)
+    model = MobileNetV3UNet(num_classes=4)
     
     if os.path.exists(args.model_path):
         state_dict = torch.load(args.model_path, map_location=device)
