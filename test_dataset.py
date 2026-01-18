@@ -28,15 +28,16 @@ def visualize_dataset(data_dir, split, n_samples, args=None):
         img = img_tensor[:3, :, :].permute(1, 2, 0).numpy()
         # It was normalized / 255.0 in dataset.
         
-        # Process Target: (6, H, W) -> (H, W, C)
-        # Channels: 0,1=UV, 2=Mask, 3=Shading(Luma), 4=FlatCanny, 5=WarpedCanny
+        # Process Target: (9, H, W) -> (H, W, C)
+        # Channels: 0,1=UV, 2=Mask, 3=Shading(Luma), 4,5,6=FlatRGB, 7=FlatCanny, 8=WarpedCanny
         target = target_tensor.permute(1, 2, 0).numpy()
         
         uv_map = target[..., :2]
         mask = target[..., 2]
         shading = target[..., 3:4]
-        flat_canny = target[..., 4]
-        warped_canny = target[..., 5]
+        flat_img = target[..., 4:7]
+        flat_canny = target[..., 7]
+        warped_canny = target[..., 8]
         
         # Visualize UV Map (encoded as colors for visibility)
         # Standard UV visualization: Red=U, Green=V, Blue=0
@@ -90,9 +91,9 @@ def visualize_dataset(data_dir, split, n_samples, args=None):
         axes[6].set_title("Derived Albedo")
         axes[6].axis('off')
         
-        # Combined Canny Visualization (Red=Flat sampled? No, just overlap)
-        # We can't easily show overlap here without warping, but we can show them side by side.
-        axes[7].axis('off') # Placeholder
+        axes[7].imshow(np.clip(flat_img, 0, 1))
+        axes[7].set_title("GT Flat Texture")
+        axes[7].axis('off')
         
         out_path = f"test_sample_{i}_{split}.png"
         plt.tight_layout()

@@ -208,7 +208,8 @@ def infer_high_res(model, img_path, device='cpu', num_points=2500, method='gridd
     
     # 4. Inference
     with torch.no_grad():
-        pred = model(input_tensor)
+        pred_logits = model(input_tensor)
+        pred = torch.sigmoid(pred_logits)
         
     pred = pred.squeeze(0).permute(1, 2, 0).cpu().numpy()
     
