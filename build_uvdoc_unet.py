@@ -15,6 +15,9 @@ import orjson
 import torch
 from huggingface_hub import snapshot_download
 import torch.nn.functional as F
+import os
+
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 # --- Configuration ---
 # 256x256 is standard for mobile UNets (fast). 
@@ -80,7 +83,7 @@ def load_mat_file(path):
     try:
         mat = scipy.io.loadmat(str(path))
         keys = [k for k in mat.keys() if not k.startswith('__')]
-        if not keys: return None
+        if not keys: return None, None
         
         key = keys[0]
         if 'grid2d' in keys: key = 'grid2d'
@@ -175,11 +178,25 @@ def process_uvdoc_dataset(raw_dir: Path, output_dir: Path):
         return
 
     images = list(src_img_dir.glob("*.png")) + list(src_img_dir.glob("*.jpg"))
-    print(f"Found {len(images)} images.")
+    existing_train_img_ids = np.array([img_path.stem for img_path in img_dir_train.glob("*.jpg")])
+    existing_train_mask_ids = np.array([img_path.stem for img_path in mask_dir_train.glob("*.npy")])
+    existing_val_img_ids = np.array([img_path.stem for img_path in img_dir_val.glob("*.jpg")])
+    existing_val_mask_ids = np.array([img_path.stem for img_path in mask_dir_val.glob("*.npy")])
+
+    # an id exists if its present in train or val img and mask
+    existing_train_ids = np.intersect1d(existing_train_img_ids, existing_train_mask_ids)
+    existing_val_ids = np.intersect1d(existing_val_img_ids, existing_val_mask_ids)
+    existing_ids = np.concatenate([existing_train_ids, existing_val_ids])
+
+    images = [img_path for img_path in images if img_path.stem not in existing_ids]
+    print(f"Found {len(images)} new images. Already existing processed images: {len(existing_ids)}")
     
     # Simple split based on hash
     for img_path in tqdm(images, desc="Processing"):
         img_id = img_path.stem
+
+        if Path(img_dir_train / f"{img_id}.jpg").exists() and Path(img_dir_val / f"{img_id}.jpg").exists() and Path(mask_dir_train / f"{img_id}.npy").exists() and Path(mask_dir_val / f"{img_id}.npy").exists():
+            continue
         
         # 1. Load Metadata
         meta_path = src_meta_dir / f"{img_id}.json"
@@ -392,7 +409,7 @@ def reconstruct_flat_albedo_tensor(alb, bm, target_size):
     return cv2.cvtColor(flat_albedo_u8, cv2.COLOR_RGB2BGR)
 
 
-def process_doc3d_dataset(raw_dir: Path, output_dir: Path):
+def process_doc3d_dataset(raw_dir: Path, output_dir: Path, max_partitions: int = 3):
     """
     1. Unzips the Doc3D dataset into the unzipped dir (raw_dir / "doc3d_raw")
     2. flattens out the partitions into the category dirs (unzipped_dir / "img", "alb", "bm", "uv")
@@ -420,6 +437,7 @@ def process_doc3d_dataset(raw_dir: Path, output_dir: Path):
 
         # unzip
         zips = list((raw_dir / "doc3d").glob(f"{category}_*.zip"))
+        zips = [zip_path for zip_path in zips if int(zip_path.stem.split("_")[1]) <= max_partitions]
         for zip_partition in tqdm(zips, desc=f"Unzipping {category} Partitions"):
             unzip_file(zip_partition, cat_dir, skip_dirs=[])
 
@@ -441,7 +459,7 @@ def process_doc3d_dataset(raw_dir: Path, output_dir: Path):
     out_uv = output_dir / "uv" # uv map
     out_flat = output_dir / "flat_albedo" # flat albedo img
     
-    for d in [out_flat, out_shading, out_uv, out_img]:
+    for d in [out_flat, out_shading, out_uv, out_img, out_alb]:
         d.mkdir(parents=True, exist_ok=True)
 
     img_files = list((unzipped_root / "img").glob("*.png"))
@@ -473,22 +491,54 @@ def process_doc3d_dataset(raw_dir: Path, output_dir: Path):
         if uv is None:
             print(f"Error: {uv_path} not found.")
             continue
-        # Doc3D UVs are (H, W, 2) or (H, W, 3). We usually need first 2 channels.
-        # Often normalized 0..1.
+        
+        # Doc3D UVs are often (V, U, 0) or (V, U) in EXR when read by OpenCV
+        # We want to standardize to (U, V, Mask) or just (U, V)
+        # Based on testing, Channel 0 is V, Channel 1 is U.
+        # We also need to flip V for OpenCV compatibility (0 at top, 1 at bottom)
+        if uv.shape[-1] >= 2:
+            v_chan = uv[..., 0]
+            u_chan = uv[..., 1]
+            # Standardize to (U, V)
+            uv = np.stack([u_chan, 1.0 - v_chan], axis=-1)
+        
         uv_resized = cv2.resize(uv, TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
-        if uv_resized.shape[-1] > 2: uv_resized = uv_resized[..., :2]
+        
+        # Pad to 3 channels for EXR saving if needed (OpenCV requirement)
+        if uv_resized.shape[-1] == 2:
+            uv_resized = np.pad(uv_resized, ((0, 0), (0, 0), (0, 1)), mode='constant')
+        elif uv_resized.shape[-1] > 3:
+            uv_resized = uv_resized[..., :3]
+
         cv2.imwrite(str(out_uv / f"{img_id}.exr"), uv_resized)
 
         bm_data, source = load_mat_file(bm_path)
         if bm_data is None or source is None:
             print(f"Error: {bm_path} not found.")
             continue
-        # Resize BM: Since BM contains coordinates/indices, standard resizing is tricky if it's pixels.
-        # If normalized 0..1, linear resize is fine. 
-        # Doc3D BM is typically normalized 0..1 (float).
-        # We need to preserve the shape (H,W,2)
+        
+        # Normalize BM using ORIGINAL image dimensions
+        # Doc3D BM is in pixel coordinates of the original image (448x448)
         if bm_data.ndim == 3 and bm_data.shape[0] == 2: # Check Transpose
-            bm_data = np.transpose(bm_data, (1, 2, 0))
+            if source == 'h5py':
+                 # h5py reads (C, W, H). We want (H, W, C).
+                 # This avoids the spatial transpose (rotation + flip).
+                 bm_data = np.transpose(bm_data, (2, 1, 0))
+            else:
+                 # scipy reads (C, H, W). We want (H, W, C).
+                 bm_data = np.transpose(bm_data, (1, 2, 0))
+            
+        # Get original dimensions from img (loaded earlier)
+        h_orig, w_orig = img.shape[:2]
+        
+        # Normalize to [0, 1]
+        if bm_data.max() > 1.0:
+            bm_data = bm_data.astype(np.float32)
+            # Channel 0 is X, Channel 1 is Y
+            bm_data[..., 0] /= (w_orig - 1)
+            bm_data[..., 1] /= (h_orig - 1)
+            
+        # Now resize the normalized grid
         bm_resized = cv2.resize(bm_data, TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
 
         alb = cv2.imread(str(alb_path))
@@ -499,10 +549,27 @@ def process_doc3d_dataset(raw_dir: Path, output_dir: Path):
         cv2.imwrite(str(out_alb / f"{img_id}.png"), alb_resized)
 
         # create shading img from wrapped alb img and original img
+        # We need to handle the background (where alb is black/zero or img is background)
+        # Using the UV map to determine valid document area is robust.
+        
         gray_img = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
         gray_alb = cv2.cvtColor(alb_resized, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        
+        # Mask: Valid pixels where UV map is non-zero
+        # Background in Doc3D UV maps is (0,0,0).
+        # We use a small threshold to handle interpolation artifacts at boundaries.
+        mask = (np.max(uv_resized, axis=2) > 1e-6).astype(np.float32)
+        
+        # Calculate shading: Image = Albedo * Shading => Shading = Image / Albedo
+        # Add epsilon to avoid division by zero
         shading = gray_img / (gray_alb + 1e-6)
+        
+        # Clip to [0, 1]
         shading = np.clip(shading, 0, 1)
+        
+        # Apply mask: Set background to 0
+        shading = shading * mask
+        
         shading_u8 = (shading * 255).astype(np.uint8)
         cv2.imwrite(str(out_shading / f"{img_id}.png"), shading_u8)
         
@@ -570,14 +637,15 @@ def main():
     # download Doc3D from huggingface
     print(f"Downloading Doc3D from huggingface {args.doc3d_dir}...")
     # number of partitions to download from all available 21 Doc3D partitions
-    max_partitions = 10 
+    max_partitions = 3
     patterns = []
     for cat in ["img", "alb", "bm", "uv"]:
         for i in range(1, max_partitions + 1):
-            patterns.append(f"{cat}_{i}.zip")
+            patterns.append(f"doc3d/{cat}_{i}.zip")
         
     # downloads max partitions of img_n.zip, alb_n.zip, bm_n.zip, uv_n.zip
-    doc3d_dir = snapshot_download(repo_id=args.doc3d_dir, revision="main", local_dir=raw / "doc3d", allow_patterns=patterns)
+    print(f"Downloading {patterns} from {args.doc3d_dir}...")
+    doc3d_dir = snapshot_download(repo_id=args.doc3d_dir, local_dir=raw, allow_patterns=patterns, repo_type="dataset")
 
     process_doc3d_dataset(raw, Path(args.doc3d_out_dir))
 

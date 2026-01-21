@@ -272,7 +272,8 @@ class Doc3DDataset(Dataset):
         uv_path = self.uv_dir / f"{img_id}.exr"
         if uv_path.exists():
             uv_map = cv2.imread(str(uv_path), cv2.IMREAD_UNCHANGED)
-            # Take first 2 channels
+            # Standardized in build_uvdoc_unet.py: 
+            # Channel 0: U, Channel 1: V (OpenCV compatible)
             if uv_map.ndim == 3 and uv_map.shape[2] >= 2:
                 uv_map = uv_map[..., :2]
         else:
@@ -712,19 +713,21 @@ class GeometricLoss(nn.Module):
         loss_tv_shading = self.tv_shading_loss(pred_shading, target_mask.unsqueeze(1))
         loss_rigidity = self.jacobian_rigidity_loss(pred_uv, target_mask.unsqueeze(1))
 
-        components = {
-            "Mask": loss_mask.item(),
-            "UV": loss_uv.item(),
-            "Grad": loss_grad_total.item(),
-            "Shading": loss_shading.item(),
-            "Stiffness": loss_stiffness.item(),
-            "TV": loss_tv_shading.item(),
-            "Rigid": loss_rigidity.item(),
-            "Reproj": loss_reproj.item(),
-            "VGG": loss_vgg.item()
+        component_tensors = {
+            "Mask": loss_mask,
+            "UV": loss_uv,
+            "Grad": loss_grad_total,
+            "Shading": loss_shading,
+            "Stiffness": loss_stiffness,
+            "TV": loss_tv_shading,
+            "Rigid": loss_rigidity,
+            "Reproj": loss_reproj,
+            "VGG": loss_vgg
         }
 
-        total_loss = sum(w * self.scales.get(k, 1.0) * components[k] for k, w in weights.items()) / sum(weights.values())
+        components = {k: v.item() for k, v in component_tensors.items()}
+
+        total_loss = sum(w * self.scales.get(k, 1.0) * component_tensors[k] for k, w in weights.items()) / sum(weights.values())
         
         debug_info = {
             "recon_masked": recon_masked,

@@ -456,7 +456,12 @@ if __name__ == "__main__":
     parser.add_argument("--points", type=int, default=2500, help="Number of control points for interpolation")
     parser.add_argument("--method", default="tps", choices=['griddata', 'tps'], help="Interpolation method")
     parser.add_argument("--refine", default=True, action='store_true', help="Enable lattice refinement")
+    parser.add_argument("--device", default="cuda", choices=['cuda', 'cpu'], help="Device to run on")
     args = parser.parse_args()
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == 'cuda':
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device("cpu")
+        
     visualize_results(args.model, args.data, args.raw, args.out, args.n, device, args.points, args.method, args.refine)
