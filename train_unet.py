@@ -269,24 +269,37 @@ class Doc3DDataset(Dataset):
              img = cv2.resize(img, (self.size[1], self.size[0]))
 
         # 2. Load UV Map (.exr)
+        # Build convention (build_uvdoc_unet.py):
+        #   ch0 = U [0,1] or -1 for background
+        #   ch1 = V [0,1] or -1 for background
+        #   ch2 = document mask (~1 inside, 0 outside)
         uv_path = self.uv_dir / f"{img_id}.exr"
         if uv_path.exists():
-            uv_map = cv2.imread(str(uv_path), cv2.IMREAD_UNCHANGED)
-            # Standardized in build_uvdoc_unet.py: 
-            # Channel 0: U, Channel 1: V (OpenCV compatible)
-            if uv_map.ndim == 3 and uv_map.shape[2] >= 2:
-                uv_map = uv_map[..., :2]
+            uv_raw = cv2.imread(str(uv_path), cv2.IMREAD_UNCHANGED)
+            if uv_raw.ndim == 3 and uv_raw.shape[2] >= 3:
+                uv_map  = uv_raw[..., :2]   # U, V
+                uv_mask = uv_raw[..., 2]    # stored document mask
+            elif uv_raw.ndim == 3 and uv_raw.shape[2] == 2:
+                uv_map  = uv_raw
+                uv_mask = (uv_map[..., 0] >= 0).astype(np.float32)  # -1 sentinel
+            else:
+                uv_map  = np.zeros(self.size + (2,), dtype=np.float32)
+                uv_mask = np.zeros(self.size, dtype=np.float32)
         else:
-            uv_map = np.zeros(self.size + (2,), dtype=np.float32)
-            
-        if uv_map.shape[:2] != self.size:
-             uv_map = cv2.resize(uv_map, (self.size[1], self.size[0]), interpolation=cv2.INTER_LINEAR)
+            uv_map  = np.zeros(self.size + (2,), dtype=np.float32)
+            uv_mask = np.zeros(self.size, dtype=np.float32)
 
-        # 3. Create Mask
-        # In Doc3D, valid UVs are > 0. Usually background is exactly 0.
-        # Or check alpha channel if available. Here we assume UV > 0 check.
-        # Note: Doc3D UVs are usually normalized 0..1.
-        mask = (np.sum(uv_map, axis=-1) > 1e-6).astype(np.float32)
+        if uv_map.shape[:2] != self.size:
+            uv_map  = cv2.resize(uv_map,  (self.size[1], self.size[0]), interpolation=cv2.INTER_LINEAR)
+            uv_mask = cv2.resize(uv_mask, (self.size[1], self.size[0]), interpolation=cv2.INTER_NEAREST)
+
+        # 3. Create Mask from the stored mask channel (matches UVDoc convention)
+        mask = (uv_mask > 0.5).astype(np.float32)
+
+        # Zero out background UV values so the target is consistent with UVDocUNetDataset
+        # (which does uv_clean[uv_clean == -1] = 0 for the same reason)
+        uv_map = uv_map.copy()
+        uv_map[mask == 0] = 0.0
 
         # 4. Load Shading
         shading_path = self.shading_dir / f"{img_id}.png"

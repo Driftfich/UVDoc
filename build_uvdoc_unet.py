@@ -367,7 +367,7 @@ def process_uvdoc_dataset(raw_dir: Path, output_dir: Path):
         # Save UV Map as .npy (float precision is crucial for dewarping)
         np.save(str(dest_mask_dir / f"{img_id}.npy"), combined_label)
 
-def reconstruct_flat_albedo_tensor(alb, bm, target_size):
+def reconstruct_flat_albedo_tensor(alb, bm):
     """
     Torch-based reconstruction for speed.
     alb: numpy array (H, W, 3) BGR [0-255]
@@ -376,6 +376,10 @@ def reconstruct_flat_albedo_tensor(alb, bm, target_size):
     # 1. Explicitly move to RGB workspace for processing
     alb_rgb = cv2.cvtColor(alb, cv2.COLOR_BGR2RGB)
     alb_t = torch.from_numpy(alb_rgb).permute(2, 0, 1).float().unsqueeze(0) / 255.0 # (1, 3, H, W)
+    # Sample a source-validity mask with the same grid to remove black-edge bleed
+    # from bilinear interpolation across wrapped-image background.
+    src_valid = (np.max(alb_rgb, axis=2) > 1).astype(np.float32)
+    src_valid_t = torch.from_numpy(src_valid).unsqueeze(0).unsqueeze(0) # (1, 1, H, W)
 
     # Convert BM to Tensor & Normalize to [-1, 1]
     # Doc3D BM is typically in range [0, 448] (pixel coords of the *input* image)
@@ -399,7 +403,19 @@ def reconstruct_flat_albedo_tensor(alb, bm, target_size):
     # Note: grid_sample(input, grid)
     # input = Wrapped Albedo
     # grid = Backward Map (Flat -> Warped Coords)
-    flat_albedo = F.grid_sample(alb_t, grid, align_corners=True, mode='bilinear')
+    flat_bilinear = F.grid_sample(alb_t, grid, align_corners=True, mode='bilinear', padding_mode='border')
+    flat_nearest = F.grid_sample(alb_t, grid, align_corners=True, mode='nearest', padding_mode='border')
+    sampled_valid = F.grid_sample(src_valid_t, grid, align_corners=True, mode='bilinear', padding_mode='zeros')
+    sampled_valid = sampled_valid.clamp(min=1e-4)
+    flat_unpremul = (flat_bilinear / sampled_valid).clamp(0.0, 1.0)
+
+    # Boundary polish:
+    # - strong support -> use unpremultiplied bilinear (smooth and accurate)
+    # - weak support (edge/intersection with background) -> fall back to nearest
+    #   to avoid black interpolation streaks.
+    low, high = 0.20, 0.85
+    conf = ((sampled_valid - low) / (high - low)).clamp(0.0, 1.0)
+    flat_albedo = conf * flat_unpremul + (1.0 - conf) * flat_nearest
     
     # 2. Get RGB result
     flat_albedo = flat_albedo.squeeze(0).permute(1, 2, 0).numpy() # (H, W, 3) RGB 0-1
@@ -492,15 +508,31 @@ def process_doc3d_dataset(raw_dir: Path, output_dir: Path, max_partitions: int =
             print(f"Error: {uv_path} not found.")
             continue
         
-        # Doc3D UVs are often (V, U, 0) or (V, U) in EXR when read by OpenCV
-        # We want to standardize to (U, V, Mask) or just (U, V)
-        # Based on testing, Channel 0 is V, Channel 1 is U.
-        # We also need to flip V for OpenCV compatibility (0 at top, 1 at bottom)
-        if uv.shape[-1] >= 2:
-            v_chan = uv[..., 0]
-            u_chan = uv[..., 1]
-            # Standardize to (U, V)
-            uv = np.stack([u_chan, 1.0 - v_chan], axis=-1)
+        # Doc3D UV EXR has 3 channels with the following semantics:
+        #   ch0 = document mask (~1.0 inside document, 0 in background)
+        #   ch1 = V coordinate in [0, 1] (needs flipping: V_out = 1 - ch1)
+        #   ch2 = U coordinate in [0, 1] (no flip needed: U_out = ch2)
+        #
+        # Standardize to the same final encoding used by UVDoc targets:
+        #   stored ch0 = U in [0, 1], stored ch1 = V in [0, 1]
+        #   stored ch2 = document mask
+        # Background pixels use -1.0 sentinel so cv2.remap with
+        # BORDER_CONSTANT returns borderValue (black) instead of sampling
+        # the flat image corner (white paper).
+        # Downstream remap usage:
+        #   map_x = uv[..., 0] * (W - 1), map_y = uv[..., 1] * (H - 1)
+        if uv.shape[-1] >= 3:
+            mask   = uv[..., 0]
+            doc    = mask > 0.05
+            u_chan = np.where(doc, np.clip(uv[..., 2],        0.0, 1.0), -1.0)
+            v_chan = np.where(doc, np.clip(1.0 - uv[..., 1], 0.0, 1.0), -1.0)
+            uv = np.stack([u_chan, v_chan, mask], axis=-1).astype(np.float32)
+        elif uv.shape[-1] == 2:
+            uv = np.stack([
+                np.clip(1.0 - uv[..., 1], 0.0, 1.0),
+                np.clip(uv[..., 0], 0.0, 1.0),
+                np.zeros(uv.shape[:2], dtype=np.float32)
+            ], axis=-1).astype(np.float32)
         
         uv_resized = cv2.resize(uv, TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
         
@@ -578,7 +610,8 @@ def process_doc3d_dataset(raw_dir: Path, output_dir: Path, max_partitions: int =
             print(f"Error: {bm_path} not found.")
             continue
 
-        flat_albedo = reconstruct_flat_albedo_tensor(alb_resized, bm_resized, TARGET_SIZE)
+        flat_albedo = reconstruct_flat_albedo_tensor(alb, cv2.resize(bm_data, alb.shape[:2], interpolation=cv2.INTER_LINEAR))
+        flat_albedo = cv2.resize(flat_albedo, TARGET_SIZE)
         cv2.imwrite(str(out_flat / f"{img_id}.png"), flat_albedo)
 
     print("Done processing Doc3D images.")
@@ -637,7 +670,7 @@ def main():
     # download Doc3D from huggingface
     print(f"Downloading Doc3D from huggingface {args.doc3d_dir}...")
     # number of partitions to download from all available 21 Doc3D partitions
-    max_partitions = 3
+    max_partitions = 1
     patterns = []
     for cat in ["img", "alb", "bm", "uv"]:
         for i in range(1, max_partitions + 1):

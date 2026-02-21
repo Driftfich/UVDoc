@@ -211,24 +211,28 @@ def generate_doc3d_edges(base_dir: Path):
         cv2.imwrite(str(dest_flat_path), (flat_map * 255).astype(np.uint8))
         
         # 2. Warped Edges
-        # Load UV map
+        # Load UV map (build convention: ch0=U, ch1=V in [0,1], ch2=doc mask)
+        # Background pixels use -1 sentinel in ch0/ch1.
         uv_path = src_uv_dir / f"{img_id}.exr"
         if not uv_path.exists(): continue
-            
+
         uv = cv2.imread(str(uv_path), cv2.IMREAD_UNCHANGED)
         if uv is None: continue
-        
-        # Resize UV if needed
+
         if uv.shape[:2] != TARGET_SIZE:
-             uv = cv2.resize(uv, (TARGET_SIZE[1], TARGET_SIZE[0]), interpolation=cv2.INTER_LINEAR)
-             
-        # UV is (H, W, 3) in [0, 1]
-        # map_x = u * (W-1), map_y = v * (H-1)
-        # uv[..., 0] -> u (x), uv[..., 1] -> v (y)
+            uv = cv2.resize(uv, (TARGET_SIZE[1], TARGET_SIZE[0]), interpolation=cv2.INTER_LINEAR)
+
         h_flat, w_flat = flat_map.shape
-        map_x = (uv[..., 0] * (w_flat - 1)).astype(np.float32)
-        map_y = (uv[..., 1] * (h_flat - 1)).astype(np.float32)
-        
+
+        # Use ch2 mask to send background pixels out-of-bounds (→ borderValue=0)
+        if uv.shape[2] >= 3:
+            doc = uv[..., 2] > 0.5
+        else:
+            doc = uv[..., 0] >= 0  # fallback: -1 sentinel
+
+        map_x = np.where(doc, uv[..., 0] * (w_flat - 1), -1.0).astype(np.float32)
+        map_y = np.where(doc, uv[..., 1] * (h_flat - 1), -1.0).astype(np.float32)
+
         warped_map = cv2.remap(flat_map, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         cv2.imwrite(str(dest_warped_path), (warped_map * 255).astype(np.uint8))
 

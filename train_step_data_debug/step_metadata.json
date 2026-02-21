@@ -1,0 +1,286 @@
+{
+  "split": "train",
+  "batch_size": 20,
+  "samples": [
+    {
+      "source": "uvdoc",
+      "sample_id": "08584",
+      "mask_mean": 0.6112518310546875,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.08823449164628983
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "05535",
+      "mask_mean": 0.587738037109375,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.05143379047513008
+    },
+    {
+      "source": "doc3d",
+      "sample_id": "1_168_8-tc_Page_210-47h0001",
+      "mask_mean": 0.2927398681640625,
+      "uv_u_minmax": [
+        -0.4528251886367798,
+        0.9987181425094604
+      ],
+      "uv_v_minmax": [
+        -0.4530797302722931,
+        0.9988181591033936
+      ],
+      "reproj_mae_masked": 0.05968237295746803
+    },
+    {
+      "source": "doc3d",
+      "sample_id": "872_7-pp_Page_781-34j0001",
+      "mask_mean": 0.3956298828125,
+      "uv_u_minmax": [
+        -0.45305633544921875,
+        0.997148334980011
+      ],
+      "uv_v_minmax": [
+        -0.4530395269393921,
+        0.9992086291313171
+      ],
+      "reproj_mae_masked": 0.10352642834186554
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "18350",
+      "mask_mean": 0.512939453125,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.05105512589216232
+    },
+    {
+      "source": "doc3d",
+      "sample_id": "427_1-tc_Page_328-27C0001",
+      "mask_mean": 0.318389892578125,
+      "uv_u_minmax": [
+        -0.45304644107818604,
+        0.9978939890861511
+      ],
+      "uv_v_minmax": [
+        -0.4347749352455139,
+        0.9987119436264038
+      ],
+      "reproj_mae_masked": 0.10425397008657455
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "08430",
+      "mask_mean": 0.596282958984375,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.042895153164863586
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "10681",
+      "mask_mean": 0.5218505859375,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.07802113890647888
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "13431",
+      "mask_mean": 0.6191864013671875,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.07523572444915771
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "11862",
+      "mask_mean": 0.5394744873046875,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.0636693686246872
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "00369",
+      "mask_mean": 0.5747528076171875,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.10133491456508636
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "18095",
+      "mask_mean": 0.5401611328125,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.05136933922767639
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "17257",
+      "mask_mean": 0.5912933349609375,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.025273071601986885
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "18200",
+      "mask_mean": 0.552459716796875,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.04299509525299072
+    },
+    {
+      "source": "doc3d",
+      "sample_id": "1_23_4-pp_Page_802-phd0001",
+      "mask_mean": 0.397369384765625,
+      "uv_u_minmax": [
+        -0.45299428701400757,
+        0.9993639588356018
+      ],
+      "uv_v_minmax": [
+        -0.45303529500961304,
+        0.9994350075721741
+      ],
+      "reproj_mae_masked": 0.0877540335059166
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "15732",
+      "mask_mean": 0.584991455078125,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.09957073628902435
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "03222",
+      "mask_mean": 0.5346832275390625,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.049712035804986954
+    },
+    {
+      "source": "uvdoc",
+      "sample_id": "17089",
+      "mask_mean": 0.6223602294921875,
+      "uv_u_minmax": [
+        0.0,
+        1.0
+      ],
+      "uv_v_minmax": [
+        0.0,
+        1.0
+      ],
+      "reproj_mae_masked": 0.06497421115636826
+    },
+    {
+      "source": "doc3d",
+      "sample_id": "2_669_4-tc_Page_022-r600001",
+      "mask_mean": 0.3057861328125,
+      "uv_u_minmax": [
+        -0.4527967572212219,
+        0.9988098740577698
+      ],
+      "uv_v_minmax": [
+        -0.4521045684814453,
+        0.9991239309310913
+      ],
+      "reproj_mae_masked": 0.06684261560440063
+    },
+    {
+      "source": "doc3d",
+      "sample_id": "1_975_4-pp_Page_094-9te0001",
+      "mask_mean": 0.31768798828125,
+      "uv_u_minmax": [
+        -0.37474796175956726,
+        0.9989210367202759
+      ],
+      "uv_v_minmax": [
+        -0.42120248079299927,
+        0.9992519617080688
+      ],
+      "reproj_mae_masked": 0.10926293581724167
+    }
+  ]
+}
