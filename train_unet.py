@@ -29,6 +29,7 @@ w_shading = 8.0 # Shading Loss
 w_stiffness = 2.0 # Stiffness Loss => Paper Curvature Assumption
 w_tv_shading = 0.1 # TV Shading Loss => Shading Smoothness Loss
 w_rigidity = 2.0 # Jacobian Rigidity Loss => Local Uniformity in the Predicted UV Map => Wobbly Lines Fix
+w_structure = 8.0 # Structure Loss => Edge Alignment Loss
 
 # NEW: Content / Perceptual Losses (Replaces old 'Structure' loss)
 w_reproj = 10.0    # Pixel L1 diff between Unwarped Prediction and Flat GT
@@ -43,7 +44,8 @@ weights = {
     "TV": w_tv_shading,
     "Rigid": w_rigidity,
     "Reproj": w_reproj,
-    "VGG": w_vgg
+    "VGG": w_vgg,
+    "Structure": w_structure
 }
 
 # --- 1. UVDoc Dataset ---
@@ -601,12 +603,20 @@ class PerceptualLoss(nn.Module):
         return loss
 
 class GeometricLoss(nn.Module):
-    def __init__(self, device, scales=None):
+    def __init__(self, device, scales=None, weights_dict=None):
         super().__init__()
         self.l1 = nn.L1Loss(reduction='none')
         self.bce = nn.BCEWithLogitsLoss() 
-        self.perceptual = PerceptualLoss(device).to(device)
+        
+        # Only instantiate VGG if its weight is greater than 0
+        self.weights_dict = weights_dict if weights_dict is not None else weights
+        if self.weights_dict.get("VGG", 0) > 0:
+            self.perceptual = PerceptualLoss(device).to(device)
+        else:
+            self.perceptual = None
+            
         self.scales = scales if scales is not None else {k: 1.0 for k in weights}
+        self.weights_dict = weights_dict if weights_dict is not None else weights
         
     def gradient_loss(self, pred_uv, target_uv, mask):
         # Dy
@@ -666,6 +676,12 @@ class GeometricLoss(nn.Module):
                (diff_v_x.abs() * m_x).mean() + (diff_v_y.abs() * m_y).mean()
         return loss
 
+    def structure_loss(self, grid_pred, flat_edge_map, wraped_edge_map, target_mask):
+        pred_wraped_edges = F.grid_sample(flat_edge_map, grid_pred, align_corners=True, mode='bilinear')
+        loss = self.l1(pred_wraped_edges, wraped_edge_map)
+        loss = (loss * target_mask.unsqueeze(1)).sum() / (target_mask.unsqueeze(1).sum() + 1e-6)
+        return loss
+
     def forward(self, pred_logits, target, input_img):
         pred = torch.sigmoid(pred_logits)
         pred_uv = pred[:, :2, :, :]
@@ -677,6 +693,7 @@ class GeometricLoss(nn.Module):
         target_mask = target[:, 2, :, :]
         target_shading = target[:, 3:4, :, :]
         target_flat_img = target[:, 4:7, :, :]
+        target_flat_edge_map = target[:, 7, :, :].unsqueeze(1)
         warped_canny_map = target[:, 8, :, :].unsqueeze(1)
         target_clean_warped = target[:, 9:12, :, :]
         
@@ -719,12 +736,19 @@ class GeometricLoss(nn.Module):
         input_masked = target_clean_warped * mask_3ch
         
         loss_reproj = (self.l1(recon_masked, input_masked)).sum() / (mask_3ch.sum() + 1e-6)
-        loss_vgg = self.perceptual(recon_masked, input_masked)
+        
+        if self.perceptual is not None:
+            loss_vgg = self.perceptual(recon_masked, input_masked)
+        else:
+            loss_vgg = torch.tensor(0.0, device=pred_logits.device)
         
         # 6. Stiffness & TV & Rigid
         loss_stiffness = self.curvature_loss(pred_uv, mask_expanded)
         loss_tv_shading = self.tv_shading_loss(pred_shading, target_mask.unsqueeze(1))
         loss_rigidity = self.jacobian_rigidity_loss(pred_uv, target_mask.unsqueeze(1))
+
+        # 7. Structure Loss
+        loss_structure = self.structure_loss(grid_pred, target_flat_edge_map, warped_canny_map, target_mask.unsqueeze(1))
 
         component_tensors = {
             "Mask": loss_mask,
@@ -735,12 +759,13 @@ class GeometricLoss(nn.Module):
             "TV": loss_tv_shading,
             "Rigid": loss_rigidity,
             "Reproj": loss_reproj,
-            "VGG": loss_vgg
+            "VGG": loss_vgg,
+            "Structure": loss_structure
         }
 
         components = {k: v.item() for k, v in component_tensors.items()}
 
-        total_loss = sum(w * self.scales.get(k, 1.0) * component_tensors[k] for k, w in weights.items()) / sum(weights.values())
+        total_loss = sum(w * self.scales.get(k, 1.0) * component_tensors[k] for k, w in self.weights_dict.items()) / sum(self.weights_dict.values())
         
         debug_info = {
             "recon_masked": recon_masked,
@@ -762,43 +787,106 @@ def get_train_transforms(args):
         A.GaussNoise(std_range=(0.0, args.aug_noise_std), mean_range=(0.0, 0.0), p=args.aug_prob),
     ])
 
-def calibrate_loss_scales(model, train_loader, device, num_steps=1000):
+def calibrate_loss_scales(model, train_loader, device, num_steps=1000, adaptive=False, threshold=0.02, max_steps=5000):
     import copy
-    print(f"Starting Calibration Phase ({num_steps} steps)...")
+    from collections import deque
+    
+    print(f"Starting Calibration Phase (min steps: {num_steps}, adaptive: {adaptive})...")
     temp_model = copy.deepcopy(model).to(device)
     temp_model.train()
     optimizer = optim.AdamW(temp_model.parameters(), lr=1e-3)
-    criterion = GeometricLoss(device=device, scales=None).to(device)
     
-    sums = {}
+    # Use 1.0 weights for all components during calibration
+    # to ensure each component contributes equally to gradient updates.
+    calib_weights = {k: 1.0 if weights[k] > 0 else 0.0 for k in weights.keys()}
+    criterion = GeometricLoss(device=device, scales=None, weights_dict=calib_weights).to(device)
+    
+    sums = {k: 0.0 for k in weights.keys()}
     count = 0
-    pbar = tqdm(total=num_steps, desc="Calibrating")
+    
+    # History for stability tracking (every 100 steps)
+    chunk_size = 100
+    history = deque(maxlen=5) 
+    
+    pbar = tqdm(total=num_steps if not adaptive else None, desc="Calibrating")
     step = 0
-    while step < num_steps:
+    
+    stop = False
+    while not stop:
         for imgs, targets in train_loader:
-            if step >= num_steps: break
             imgs, targets = imgs.to(device), targets.to(device)
             optimizer.zero_grad()
             preds = temp_model(imgs)
             loss, components, _ = criterion(preds, targets, imgs)
             loss.backward()
             optimizer.step()
+            
             for k, v in components.items():
-                sums[k] = sums.get(k, 0.0) + v
+                sums[k] += v
+            
             count += 1
             step += 1
             pbar.update(1)
+            
+            # Check for stability every chunk_size steps
+            if step % chunk_size == 0:
+                # Running average of means
+                current_means = {k: v / count for k, v in sums.items()}
+                
+                if adaptive and step >= num_steps:
+                    history.append(current_means)
+                    if len(history) >= 2:
+                        # Compare normalized scales (relative importance)
+                        def get_norm_scales(m):
+                            s = {k: 1.0 / (val + 1e-8) for k, val in m.items()}
+                            total = sum(s.values())
+                            return {k: v/total for k,v in s.items()}
+                        
+                        s_prev = get_norm_scales(history[-2])
+                        s_curr = get_norm_scales(history[-1])
+                        
+                        # Calculate max relative change across all components
+                        max_change = max(abs(s_curr[k] - s_prev[k]) / (s_prev[k] + 1e-8) for k in s_curr)
+                        pbar.set_postfix({"rel_change": f"{max_change:.4f}"})
+                        
+                        if max_change < threshold:
+                            print(f"\nStable! Max relative change {max_change:.4f} < {threshold} after {step} steps.")
+                            stop = True
+                            break
+                
+                # Fixed mode or max safety limit
+                if not adaptive and step >= num_steps:
+                    stop = True
+                    break
+                if step >= max_steps:
+                    print(f"\nReached max_steps ({max_steps}) limit.")
+                    stop = True
+                    break
+        if stop: break
+
     pbar.close()
     
-    means = {k: v / count for k, v in sums.items()}
-    scales = {k: 1.0 / (v + 1e-8) for k, v in means.items()}
-    print("Calibration complete.")
+    final_means = {k: v / count for k, v in sums.items()}
+    scales = {k: 1.0 / (v + 1e-8) for k, v in final_means.items()}
+    print(f"Calibration complete after {step} steps.")
+    
+    # Explicitly free memory
+    del temp_model
+    del optimizer
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        
     return scales
 
 def train_unet(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     
+    # Handle VGG disable
+    if args.no_vgg:
+        weights["VGG"] = 0.0
+        print("VGG Perceptual loss disabled.")
+
     # 1. Prepare Transforms
     transforms_train = get_train_transforms(args)
 
@@ -833,8 +921,8 @@ def train_unet(args):
     
     # --- Calibration / Scaling ---
     scales_path = Path(args.scales_file)
-    if args.calibrate or not scales_path.exists():
-        scales = calibrate_loss_scales(model, train_loader, device, num_steps=1000)
+    if args.calibrate or args.adaptive_calibrate or not scales_path.exists():
+        scales = calibrate_loss_scales(model, train_loader, device, num_steps=1000, adaptive=args.adaptive_calibrate)
         with open(scales_path, 'w') as f:
             json.dump(scales, f, indent=4)
     else:
@@ -845,7 +933,7 @@ def train_unet(args):
         print(f"  {k}: Scale={scales[k]:.4f} * Weight={v:.1f} = {scales[k]*v:.4f}")
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-    criterion = GeometricLoss(device=device, scales=scales).to(device)
+    criterion = GeometricLoss(device=device, scales=scales, weights_dict=weights).to(device)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3)
     
     print("------ Training Config ------\n" \
@@ -941,14 +1029,16 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", default="dataset_unet")
     parser.add_argument("--doc3d_dir", default="dataset_doc3d", help="Path to processed Doc3D dataset")
     parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--batch", type=int, default=24)
+    parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--accumulate", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--no_vgg", action='store_true', help="Disable VGG perceptual loss to save VRAM and speed up training")
     parser.add_argument("--aug_prob", type=float, default=0.5)
     parser.add_argument("--aug_color", type=float, default=0.2)
     parser.add_argument("--aug_noise_std", type=float, default=0.2)
     parser.add_argument("--log_interval", type=int, default=1000)
     parser.add_argument("--calibrate", action='store_true')
+    parser.add_argument("--adaptive_calibrate", action='store_true', help="Calibrate until loss scales stabilize")
     parser.add_argument("--scales_file", default="loss_scales.json")
     parser.add_argument("--verbose", action='store_true')
     parser.add_argument("--verbose_dir", default="train_vis_debug")
