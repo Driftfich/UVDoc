@@ -17,6 +17,7 @@ from torchvision.models.feature_extraction import create_feature_extractor
 import matplotlib.pyplot as plt
 import albumentations as A
 from tqdm import tqdm
+from pytorch_msssim import MS_SSIM
 
 # Enable EXR support for Doc3D
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
@@ -33,7 +34,8 @@ w_structure = 8.0 # Structure Loss => Edge Alignment Loss
 
 # NEW: Content / Perceptual Losses (Replaces old 'Structure' loss)
 w_reproj = 10.0    # Pixel L1 diff between Unwarped Prediction and Flat GT
-w_vgg = 5.0        # VGG Perceptual loss (Feature matching)
+w_msssim = 0.0     # MS-SSIM Perceptual loss
+w_vgg = 0.0        # VGG Perceptual loss (Feature matching)
 
 weights = {
     "Mask": w_mask,
@@ -44,6 +46,7 @@ weights = {
     "TV": w_tv_shading,
     "Rigid": w_rigidity,
     "Reproj": w_reproj,
+    "MSSSIM": w_msssim,
     "VGG": w_vgg,
     "Structure": w_structure
 }
@@ -174,22 +177,37 @@ class UVDocUNetDataset(Dataset):
         else:
             clean_warped_img = np.zeros(self.size + (3,), dtype=np.float32)
         
-        # Channels: 0,1=UV, 2=Mask, 3=Shading(Luma), 4,5,6=FlatRGB, 7=FlatCanny, 8=WarpedCanny, 9,10,11=CleanWarped
-        target = np.concatenate([
-            uv_clean, 
-            valid_mask[..., None], 
-            shading_gt,
-            flat_img,
-            flat_canny[..., None],
-            warped_canny[..., None],
-            clean_warped_img
-        ], axis=-1)
-        
+        # Make 3D
+        valid_mask = valid_mask[..., None]
+        warped_canny = warped_canny[..., None]
+
         # Apply Augmentations
         if self.transforms is not None:
-            augmented = self.transforms(image=img, mask=target)
+            augmented = self.transforms(
+                image=img, 
+                mask=valid_mask,
+                uv=uv_clean,
+                shading=shading_gt,
+                warped_canny=warped_canny,
+                clean_warped=clean_warped_img
+            )
             img = augmented['image']
-            target = augmented['mask']
+            valid_mask = augmented['mask']
+            uv_clean = augmented['uv']
+            shading_gt = augmented['shading']
+            warped_canny = augmented['warped_canny']
+            clean_warped_img = augmented['clean_warped']
+            
+        # Target channels: 0,1=UV, 2=Mask, 3=Shading(Luma), 4,5,6=FlatRGB, 7=FlatCanny, 8=WarpedCanny, 9,10,11=CleanWarped
+        target = np.concatenate([
+            uv_clean, 
+            valid_mask, 
+            shading_gt,
+            flat_img, # Unchanged spatial
+            flat_canny[..., None], # Unchanged spatial
+            warped_canny,
+            clean_warped_img
+        ], axis=-1)
         
         # Preprocessing
         img = img.astype(np.float32) / 255.0
@@ -355,24 +373,39 @@ class Doc3DDataset(Dataset):
         if flat_canny.shape != self.size: flat_canny = cv2.resize(flat_canny, (self.size[1], self.size[0]))
         if warped_canny.shape != self.size: warped_canny = cv2.resize(warped_canny, (self.size[1], self.size[0]))
 
+        # Make 3D
+        mask = mask[..., None]
+        warped_canny = warped_canny[..., None]
+
+        # Apply Augmentations
+        if self.transforms:
+            augmented = self.transforms(
+                image=img, 
+                mask=mask,
+                uv=uv_map,
+                shading=shading,
+                warped_canny=warped_canny,
+                clean_warped=clean_warped
+            )
+            img = augmented['image']
+            mask = augmented['mask']
+            uv_map = augmented['uv']
+            shading = augmented['shading']
+            warped_canny = augmented['warped_canny']
+            clean_warped = augmented['clean_warped']
+
         # Assemble Target
         # Must match UVDocUNetDataset structure exactly
         # Channels: 0,1=UV, 2=Mask, 3=Shading, 4-6=Flat, 7=FlatCanny, 8=WarpedCanny, 9-11=CleanWarped
         target = np.concatenate([
             uv_map,                 # 0-1
-            mask[..., None],        # 2
+            mask,                   # 2
             shading,                # 3
-            flat_img,               # 4-6
-            flat_canny[..., None],  # 7
-            warped_canny[..., None],# 8
+            flat_img,               # 4-6 (Unchanged spatial)
+            flat_canny[..., None],  # 7 (Unchanged spatial)
+            warped_canny,           # 8
             clean_warped            # 9-11
         ], axis=-1)
-
-        # Transforms
-        if self.transforms:
-            augmented = self.transforms(image=img, mask=target)
-            img = augmented['image']
-            target = augmented['mask']
 
         # Preprocessing
         img = img.astype(np.float32) / 255.0
@@ -385,15 +418,64 @@ class Doc3DDataset(Dataset):
 
 
 # --- 3. Model: MobileNetV3-UNet (5-Channel Input) ---
+class CBAM(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        # Channel attention
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        # Ensure minimum reduction to avoid 0 channels
+        reduced_channels = max(channels // reduction, 1)
+        
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, reduced_channels, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(reduced_channels, channels, 1, bias=False)
+        )
+        
+        # Spatial attention
+        self.spatial_conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        # Channel attention part
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        channel_att = self.sigmoid(avg_out + max_out)
+        x = x * channel_att
+        
+        # Spatial attention part
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        spatial_in = torch.cat([avg_out, max_out], dim=1)
+        spatial_att = self.sigmoid(self.spatial_conv(spatial_in))
+        
+        return x * spatial_att
+
 class UpBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        # Apply CBAM attention to the skip connection features
+        self.attention = CBAM(skip_c)
+        # Depthwise Separable Convolution
         self.conv = nn.Sequential(
-            nn.Conv2d(in_c + skip_c, out_c, 3, padding=1, bias=False),
+            # Depthwise conv
+            nn.Conv2d(in_c + skip_c, in_c + skip_c, 3, padding=1, groups=in_c + skip_c, bias=False),
+            nn.BatchNorm2d(in_c + skip_c),
+            nn.ReLU(inplace=True),
+            # Pointwise conv
+            nn.Conv2d(in_c + skip_c, out_c, 1, bias=False),
             nn.BatchNorm2d(out_c),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_c, out_c, 3, padding=1, bias=False),
+            
+            # Depthwise conv
+            nn.Conv2d(out_c, out_c, 3, padding=1, groups=out_c, bias=False),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU(inplace=True),
+            # Pointwise conv
+            nn.Conv2d(out_c, out_c, 1, bias=False),
             nn.BatchNorm2d(out_c),
             nn.ReLU(inplace=True)
         )
@@ -402,6 +484,10 @@ class UpBlock(nn.Module):
         x = self.up(x)
         if x.shape[2] != skip.shape[2] or x.shape[3] != skip.shape[3]:
             x = F.interpolate(x, size=(skip.shape[2], skip.shape[3]), mode='bilinear', align_corners=True)
+        
+        # Apply attention to skip connection
+        skip = self.attention(skip)
+        
         x = torch.cat([x, skip], dim=1)
         return self.conv(x)
 
@@ -615,6 +701,11 @@ class GeometricLoss(nn.Module):
         else:
             self.perceptual = None
             
+        if self.weights_dict.get("MSSSIM", 0) > 0:
+            self.ms_ssim = MS_SSIM(data_range=1.0, size_average=True, channel=3).to(device)
+        else:
+            self.ms_ssim = None
+            
         self.scales = scales if scales is not None else {k: 1.0 for k in weights}
         self.weights_dict = weights_dict if weights_dict is not None else weights
         
@@ -741,6 +832,14 @@ class GeometricLoss(nn.Module):
             loss_vgg = self.perceptual(recon_masked, input_masked)
         else:
             loss_vgg = torch.tensor(0.0, device=pred_logits.device)
+            
+        if self.ms_ssim is not None:
+            # MS-SSIM expects shape (N, C, H, W). And it works better without large empty mask regions,
+            # but applying it to the masked image is fine as long as values are in [0, 1].
+            # Values are currently in [0, 1] because target_flat_img is [0, 1]
+            loss_msssim = 1 - self.ms_ssim(recon_masked, input_masked)
+        else:
+            loss_msssim = torch.tensor(0.0, device=pred_logits.device)
         
         # 6. Stiffness & TV & Rigid
         loss_stiffness = self.curvature_loss(pred_uv, mask_expanded)
@@ -759,6 +858,7 @@ class GeometricLoss(nn.Module):
             "TV": loss_tv_shading,
             "Rigid": loss_rigidity,
             "Reproj": loss_reproj,
+            "MSSSIM": loss_msssim,
             "VGG": loss_vgg,
             "Structure": loss_structure
         }
@@ -776,7 +876,28 @@ class GeometricLoss(nn.Module):
         return total_loss, components, debug_info
 
 def get_train_transforms(args):
-    return A.Compose([
+    transforms = []
+    
+    if getattr(args, 'no_spatial_aug', False) == False:
+        print("Applying Spatial Augmentations...")
+        transforms.extend([
+            A.Affine(
+                scale=(0.9, 1.1),
+                translate_percent=(-0.0625, 0.0625),
+                rotate=(-15, 15),
+                fill=0, # Black border for image
+                fill_mask=0, # Black border for mask
+                p=args.aug_prob
+            ),
+            A.Perspective(
+                scale=(0.05, 0.1),
+                fill=0,
+                fill_mask=0,
+                p=args.aug_prob
+            )
+        ])
+        
+    transforms.extend([
         A.ColorJitter(
             brightness=args.aug_color, 
             contrast=args.aug_color, 
@@ -786,6 +907,13 @@ def get_train_transforms(args):
         ),
         A.GaussNoise(std_range=(0.0, args.aug_noise_std), mean_range=(0.0, 0.0), p=args.aug_prob),
     ])
+    
+    return A.Compose(transforms, additional_targets={
+        'uv': 'mask',
+        'shading': 'mask',
+        'warped_canny': 'mask',
+        'clean_warped': 'mask'
+    })
 
 def calibrate_loss_scales(model, train_loader, device, num_steps=1000, adaptive=False, threshold=0.02, max_steps=5000):
     import copy
@@ -883,9 +1011,9 @@ def train_unet(args):
     print(f"Device: {device}")
     
     # Handle VGG disable
-    if args.no_vgg:
+    if not args.use_vgg:
         weights["VGG"] = 0.0
-        print("VGG Perceptual loss disabled.")
+        print("VGG Perceptual loss disabled (default).")
 
     # 1. Prepare Transforms
     transforms_train = get_train_transforms(args)
@@ -921,7 +1049,18 @@ def train_unet(args):
     
     # --- Calibration / Scaling ---
     scales_path = Path(args.scales_file)
-    if args.calibrate or args.adaptive_calibrate or not scales_path.exists():
+    if scales_path.exists():
+        with open(scales_path, 'r') as f:
+            scales = json.load(f)
+    else:
+        scales = None
+
+    # check if scales are available for all components with weights > 0
+    if any(v > 0 for k, v in weights.items() if scales is not None and k not in scales.keys()):
+        print(f"Scales are not available for all components with weights > 0. Calibrating...")
+        scales = None
+
+    if args.calibrate or args.adaptive_calibrate or scales is None:
         scales = calibrate_loss_scales(model, train_loader, device, num_steps=1000, adaptive=args.adaptive_calibrate)
         with open(scales_path, 'w') as f:
             json.dump(scales, f, indent=4)
@@ -1032,8 +1171,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--accumulate", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--no_vgg", action='store_true', help="Disable VGG perceptual loss to save VRAM and speed up training")
+    parser.add_argument("--use_vgg", action='store_true', help="Enable VGG perceptual loss (disabled by default to save VRAM)")
     parser.add_argument("--aug_prob", type=float, default=0.5)
+    parser.add_argument("--no_spatial_aug", action='store_true', help="Disable spatial augmentations (Affine/Perspective)")
     parser.add_argument("--aug_color", type=float, default=0.2)
     parser.add_argument("--aug_noise_std", type=float, default=0.2)
     parser.add_argument("--log_interval", type=int, default=1000)

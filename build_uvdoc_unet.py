@@ -522,25 +522,41 @@ def process_doc3d_dataset(raw_dir: Path, output_dir: Path, max_partitions: int =
         # Downstream remap usage:
         #   map_x = uv[..., 0] * (W - 1), map_y = uv[..., 1] * (H - 1)
         if uv.shape[-1] >= 3:
-            mask   = uv[..., 0]
-            doc    = mask > 0.05
-            u_chan = np.where(doc, np.clip(uv[..., 2],        0.0, 1.0), -1.0)
-            v_chan = np.where(doc, np.clip(1.0 - uv[..., 1], 0.0, 1.0), -1.0)
-            uv = np.stack([u_chan, v_chan, mask], axis=-1).astype(np.float32)
+            mask = uv[..., 0]
+            # Create a clean mask for the document area
+            doc = mask > 0.1
+            
+            # 1. Fill background with 0.0 before resizing to avoid sentinel bleeding
+            u_chan = np.where(doc, np.clip(uv[..., 2], 0.0, 1.0), 0.0)
+            v_chan = np.where(doc, np.clip(1.0 - uv[..., 1], 0.0, 1.0), 0.0)
+            
+            # Stack U, V, and Mask for a single resize operation
+            uv_stack = np.stack([u_chan, v_chan, mask], axis=-1).astype(np.float32)
+            uv_resized = cv2.resize(uv_stack, TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
+            
+            # 2. Re-apply the -1.0 sentinel to the resized UV map
+            # We threshold the interpolated mask to determine the new document boundary
+            res_mask = uv_resized[..., 2]
+            final_doc_mask = res_mask > 0.5
+            
+            # Set background to -1.0 sentinel
+            uv_resized[..., 0] = np.where(final_doc_mask, uv_resized[..., 0], -1.0)
+            uv_resized[..., 1] = np.where(final_doc_mask, uv_resized[..., 1], -1.0)
+            # Channel 2 remains the continuous [0, 1] mask
         elif uv.shape[-1] == 2:
-            uv = np.stack([
-                np.clip(1.0 - uv[..., 1], 0.0, 1.0),
-                np.clip(uv[..., 0], 0.0, 1.0),
-                np.zeros(uv.shape[:2], dtype=np.float32)
-            ], axis=-1).astype(np.float32)
+            # Fallback for 2-channel case (less common in Doc3D)
+            u_chan = np.clip(1.0 - uv[..., 1], 0.0, 1.0)
+            v_chan = np.clip(uv[..., 0], 0.0, 1.0)
+            uv_stack = np.stack([u_chan, v_chan], axis=-1).astype(np.float32)
+            uv_resized = cv2.resize(uv_stack, TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
+            # Pad with a zero mask channel
+            uv_resized = np.pad(uv_resized, ((0, 0), (0, 0), (0, 1)), mode='constant', constant_values=0)
         
-        uv_resized = cv2.resize(uv, TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
-        
-        # Pad to 3 channels for EXR saving if needed (OpenCV requirement)
-        if uv_resized.shape[-1] == 2:
-            uv_resized = np.pad(uv_resized, ((0, 0), (0, 0), (0, 1)), mode='constant')
-        elif uv_resized.shape[-1] > 3:
+        # Ensure we have exactly 3 channels for EXR saving
+        if uv_resized.shape[-1] > 3:
             uv_resized = uv_resized[..., :3]
+        elif uv_resized.shape[-1] == 2:
+            uv_resized = np.pad(uv_resized, ((0, 0), (0, 0), (0, 1)), mode='constant', constant_values=0)
 
         cv2.imwrite(str(out_uv / f"{img_id}.exr"), uv_resized)
 
@@ -571,7 +587,7 @@ def process_doc3d_dataset(raw_dir: Path, output_dir: Path, max_partitions: int =
             bm_data[..., 1] /= (h_orig - 1)
             
         # Now resize the normalized grid
-        bm_resized = cv2.resize(bm_data, TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
+        # bm_resized = cv2.resize(bm_data, TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
 
         alb = cv2.imread(str(alb_path))
         if alb is None: 
@@ -680,7 +696,7 @@ def main():
     print(f"Downloading {patterns} from {args.doc3d_dir}...")
     doc3d_dir = snapshot_download(repo_id=args.doc3d_dir, local_dir=raw, allow_patterns=patterns, repo_type="dataset")
 
-    process_doc3d_dataset(raw, Path(args.doc3d_out_dir))
+    process_doc3d_dataset(raw, Path(args.doc3d_out_dir), max_partitions)
 
 
 
