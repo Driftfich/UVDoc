@@ -275,7 +275,7 @@ class MainActivity : AppCompatActivity() {
         
         cameraExecutor.execute {
             val startTime = System.currentTimeMillis()
-            val result = imageProcessor.processImage(bitmap, shadingStrength)
+            val result = imageProcessor.processImage(bitmap)
             val time = System.currentTimeMillis() - startTime
             
             runOnUiThread {

@@ -4,9 +4,10 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from pathlib import Path
-from train_unet import MobileNetV3UNet, UVDocUNetDataset
+from train_unet import MobileNetV3UNet, FastViTUNet, UVDocUNetDataset
 from scipy.interpolate import griddata
 from tqdm import tqdm
+import orjson 
 
 class TPSSolver:
     def __init__(self, device='cpu'):
@@ -215,12 +216,12 @@ def infer_high_res(model, img_path, device='cpu', num_points=2500, method='gridd
     
     uv_pred_low = pred[..., :2]
     mask_pred_low = pred[..., 2]
-    shading_pred_low = pred[..., 3:4] # 1 channel luma
+    # shading_pred_low = pred[..., 3:4] # 1 channel luma
     
     # Resize shading to original resolution
-    shading_high = cv2.resize(shading_pred_low, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
-    if shading_high.ndim == 2:
-        shading_high = shading_high[..., None]
+    # shading_high = cv2.resize(shading_pred_low, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
+    # if shading_high.ndim == 2:
+    #     shading_high = shading_high[..., None]
     
     # Mask shading with predicted mask (upscaled) to remove background artifacts
     mask_pred_high = cv2.resize(mask_pred_low, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
@@ -240,19 +241,19 @@ def infer_high_res(model, img_path, device='cpu', num_points=2500, method='gridd
     mask_pred_bin_eroded = cv2.erode(mask_pred_bin, kernel, iterations=1)
     
     # Apply mask to shading
-    shading_high = shading_high * mask_pred_bin_eroded[..., None]
-    shading_high = np.clip(shading_high, 0.05, 1.0) 
+    # shading_high = shading_high * mask_pred_bin_eroded[..., None]
+    # shading_high = np.clip(shading_high, 0.05, 1.0) 
 
     # Prepare Albedo
     img_float = img_orig.astype(np.float32) / 255.0 # RGB 0-1
     
     # Smooth shading slightly to remove remaining model jitter
-    shading_final = cv2.GaussianBlur(shading_high, (15, 15), 0)
-    if shading_final.ndim == 2:
-        shading_final = shading_final[..., None]
+    # shading_final = cv2.GaussianBlur(shading_high, (15, 15), 0)
+    # if shading_final.ndim == 2:
+    #     shading_final = shading_final[..., None]
     
     # Calculate Albedo (Broadcasting RGB / Luma)
-    albedo = img_float / shading_final
+    albedo = img_float # / shading_final
     albedo = np.clip(albedo, 0, 1)
     
     # 5. Backward Map Generation
@@ -375,14 +376,15 @@ def infer_high_res(model, img_path, device='cpu', num_points=2500, method='gridd
     dst_xs = u_mapped[valid_fwd]
     forward_warp[dst_ys, dst_xs] = img_orig[ys, xs]
     
-    return img_orig, dewarped_orig, shading_high, dewarped_albedo, uv_vis, forward_warp
+    return img_orig, dewarped_orig, dewarped_orig, dewarped_albedo, uv_vis, forward_warp # temporarily removing shading_high
 
-def visualize_results(model_path, data_dir, raw_dir, out_dir, num_samples=3, device='cpu', points=2500, method='griddata', refine=False):
+def visualize_results(model_path, uvdoc_dir, doc3d_dir, uvdoc_raw_dir, doc3d_raw_dir, out_dir, num_samples=3, device='cpu', points=2500, method='griddata', refine=False):
     
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    model = MobileNetV3UNet(num_classes=4)
+    # model = MobileNetV3UNet(num_classes=3) # temporarily removing shading prediction: num classes 4 => 3
+    model = FastViTUNet(num_classes=3)
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))
     except FileNotFoundError:
@@ -392,25 +394,33 @@ def visualize_results(model_path, data_dir, raw_dir, out_dir, num_samples=3, dev
     model.to(device)
     model.eval()
     
-    val_names = [p.name for p in Path(data_dir).joinpath("val/images").glob("*.jpg")]
+    uvdoc_val_names = [p.stem for p in Path(uvdoc_dir).joinpath("val/images").glob("*.jpg")]
+    doc3d_val_names = orjson.loads(Path(doc3d_dir).joinpath("split.json").read_text())["val"]
+
+    uvdoc_names_raw = [p.stem for p in Path(uvdoc_raw_dir).glob("*.png")]
+    doc3d_names_raw = [p.stem for p in Path(doc3d_raw_dir).glob("*.png")]
+
+    doc3d_val_names = list(set(doc3d_val_names) & set(doc3d_names_raw))
+    uvdoc_val_names = list(set(uvdoc_val_names) & set(uvdoc_names_raw))
+
+    doc3d_val_names = [f"{doc3d_raw_dir}/{name}.png" for name in doc3d_val_names]
+    uvdoc_val_names = [f"{uvdoc_raw_dir}/{name}.png" for name in uvdoc_val_names]
+
+    val_names_raw = doc3d_val_names + uvdoc_val_names
     
-    if not val_names:
+    if not val_names_raw or len(val_names_raw) == 0:
         print("No validation images found.")
         return
-        
-    selected_names = np.random.choice(val_names, min(len(val_names), num_samples), replace=False)
+    
+    selected_names = np.random.choice(val_names_raw, min(len(val_names_raw), num_samples), replace=False)
     
     for name in tqdm(selected_names, desc="Processing images"):
-        stem = Path(name).stem
-        matches = list(Path(raw_dir).glob(f"{stem}.*"))
-        if not matches:
-            print(f"Error: image {stem} not found.")
-            continue
-        raw_img_path = matches[0]
+        path = Path(name)
+        stem = path.stem
         
-        print(f"Processing {raw_img_path.name}...")
+        print(f"Processing {path.name}...")
         orig, res, shading, albedo, uv_vis, fwd_warp = infer_high_res(
-            model, raw_img_path, device, points, method, refine
+            model, name, device, points, method, refine
         )
         
         if res is not None:
@@ -424,10 +434,10 @@ def visualize_results(model_path, data_dir, raw_dir, out_dir, num_samples=3, dev
             albedo_disp = cv2.resize(albedo, (new_w, h))
             fwd_warp_disp = cv2.resize(fwd_warp, (new_w, h))
             
-            shading_disp = (shading.squeeze(-1) * 255).astype(np.uint8)
-            shading_disp = cv2.resize(shading_disp, (w, h))
-            # Convert grayscale to RGB for stacking
-            shading_disp = cv2.cvtColor(shading_disp, cv2.COLOR_GRAY2RGB)
+            # shading_disp = (shading.squeeze(-1) * 255).astype(np.uint8)
+            # shading_disp = cv2.resize(shading_disp, (w, h))
+            # # Convert grayscale to RGB for stacking
+            # shading_disp = cv2.cvtColor(shading_disp, cv2.COLOR_GRAY2RGB)
             
             def add_label(img, text):
                 img = img.astype(np.uint8).copy()
@@ -439,18 +449,20 @@ def visualize_results(model_path, data_dir, raw_dir, out_dir, num_samples=3, dev
             img2 = add_label(uv_vis, "2. UV Grid (Pred)")
             img3 = add_label(fwd_warp_disp, "3. Fwd Warp (Raw)")
             img4 = add_label((res_disp * 255).astype(np.uint8), f"4. Dewarped ({method})")
-            img5 = add_label(shading_disp, "5. Shading")
+            # img5 = add_label(shading_disp, "5. Shading")
             img6 = add_label((albedo_disp * 255).astype(np.uint8), "6. Albedo (Result)")
             
-            combined = np.hstack([img1, img2, img3, img4, img5, img6])
+            combined = np.hstack([img1, img2, img3, img4, img6])
             cv2.imwrite(out_dir / out_name, cv2.cvtColor(combined, cv2.COLOR_RGB2BGR))
             print(f"Saved {out_dir / out_name}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="unet_best.pth")
-    parser.add_argument("--data", default="dataset_unet")
-    parser.add_argument("--raw", default="downloads/UVDoc_final/img")
+    parser.add_argument("--uvdoc_dir", default="dataset_unet")
+    parser.add_argument("--doc3d_dir", default="dataset_doc3d")
+    parser.add_argument("--uvdoc_raw_dir", default="downloads/UVDoc_final/img")
+    parser.add_argument("--doc3d_raw_dir", default="downloads/doc3d_raw/img")
     parser.add_argument("--out", default=".")
     parser.add_argument("--n", type=int, default=3)
     parser.add_argument("--points", type=int, default=2500, help="Number of control points for interpolation")
@@ -464,4 +476,4 @@ if __name__ == "__main__":
     else:
         device = torch.device("cpu")
         
-    visualize_results(args.model, args.data, args.raw, args.out, args.n, device, args.points, args.method, args.refine)
+    visualize_results(args.model, args.uvdoc_dir, args.doc3d_dir, args.uvdoc_raw_dir, args.doc3d_raw_dir, args.out, args.n, device, args.points, args.method, args.refine)

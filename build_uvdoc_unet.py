@@ -686,7 +686,7 @@ def main():
     # download Doc3D from huggingface
     print(f"Downloading Doc3D from huggingface {args.doc3d_dir}...")
     # number of partitions to download from all available 21 Doc3D partitions
-    max_partitions = 5
+    max_partitions = 10
     patterns = []
     for cat in ["img", "alb", "bm", "uv"]:
         for i in range(1, max_partitions + 1):

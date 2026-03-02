@@ -6,7 +6,8 @@ import sys
 import numpy as np
 import torch
 import tensorflow as tf
-from train_unet import MobileNetV3UNet
+from train_unet import MobileNetV3UNet, FastViTUNet
+from mobileone import reparameterize_model
 
 def check_dependencies():
     """Checks if required tools are installed."""
@@ -124,7 +125,7 @@ def main():
     # 1. Load PyTorch Model
     print("Loading PyTorch model...")
     device = torch.device('cpu')
-    model = MobileNetV3UNet(num_classes=4)
+    model = FastViTUNet(num_classes=3)
     
     if os.path.exists(args.model_path):
         state_dict = torch.load(args.model_path, map_location=device)
@@ -133,6 +134,11 @@ def main():
         print(f"Warning: Model path {args.model_path} not found. Using random weights for testing.")
     
     model.eval()
+
+    # FastViT Reparameterization
+    print("Reparameterizing FastViT...")
+    model = reparameterize_model(model)
+    print("FastViT reparameterized.")
     
     # Input shape: (Batch, Channels, Height, Width)
     # 5 channels: R, G, B, X_coord, Y_coord

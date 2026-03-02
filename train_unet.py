@@ -18,19 +18,20 @@ import matplotlib.pyplot as plt
 import albumentations as A
 from tqdm import tqdm
 from pytorch_msssim import MS_SSIM
+import timm
 
 # Enable EXR support for Doc3D
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 # define weights
-w_mask = 1.0 # Document Mask Loss
+w_mask = 2.0 # Document Mask Loss
 w_uv = 10.0 # UV + Canny Edge Loss => Dewarping and Edge Alignment Loss
-w_grad = 4.0 # Gradient Loss => Forces similar gradient in the GT and Predicted UV Map => Smoothness Loss
-w_shading = 8.0 # Shading Loss
-w_stiffness = 2.0 # Stiffness Loss => Paper Curvature Assumption
-w_tv_shading = 0.1 # TV Shading Loss => Shading Smoothness Loss
-w_rigidity = 2.0 # Jacobian Rigidity Loss => Local Uniformity in the Predicted UV Map => Wobbly Lines Fix
-w_structure = 8.0 # Structure Loss => Edge Alignment Loss
+w_grad = 0.0 # 4.0 # Gradient Loss => Forces similar gradient in the GT and Predicted UV Map => Smoothness Loss
+w_shading = 0.0 # Shading Loss => temporarily disabled
+w_stiffness = 0.0 # 2.0 # Stiffness Loss => Paper Curvature Assumption
+w_tv_shading = 0.0 # TV Shading Loss => Shading Smoothness Loss => temporarily disabled
+w_rigidity = 0.0 # 2.0 # Jacobian Rigidity Loss => Local Uniformity in the Predicted UV Map => Wobbly Lines Fix
+w_structure = 0.0 # 8.0 # Structure Loss => Edge Alignment Loss
 
 # NEW: Content / Perceptual Losses (Replaces old 'Structure' loss)
 w_reproj = 10.0    # Pixel L1 diff between Unwarped Prediction and Flat GT
@@ -569,7 +570,7 @@ class SobelLayer(nn.Module):
         return mag
 
 class MobileNetV3UNet(nn.Module):
-    def __init__(self, num_classes=4): # U, V, Mask, Shading (Luma)
+    def __init__(self, num_classes=3): # U, V, Mask, # Shading (Luma)
         super().__init__()
         
         self.sobel = SobelLayer()
@@ -655,6 +656,75 @@ class MobileNetV3UNet(nn.Module):
         
         out = self.final(d5)
         return out # Return logits
+
+class FastViTUNet(nn.Module):
+    def __init__(self, num_classes=3): # U, V, Mask
+        super().__init__()
+        
+        self.sobel = SobelLayer()
+        self.encoder = timm.create_model('fastvit_t8', pretrained=True, in_chans=6, features_only=True)
+        self.context_bot = ContextBlock(384, 64)
+        
+        # Upsampling nur noch bis 32x32
+        self.up1 = UpBlock(in_c=64, skip_c=192, out_c=128) # 8x8 -> 16x16
+        self.up2 = UpBlock(in_c=128, skip_c=96, out_c=64)  # 16x16 -> 32x32
+        
+        # --- NEU: Kapazität erhalten, aber Auflösung klein halten ---
+        # Ersetzt up3, up4 und up5. Verfeinert die 32x32 Features.
+        self.refine1 = nn.Sequential(
+            nn.Conv2d(64, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.refine2 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Ausgabe des 32x32 Gitters
+        self.final_sparse = nn.Conv2d(32, num_classes, 1)
+
+    def forward(self, x):
+        edges = self.sobel(x[:, :3, :, :])
+        b, _, h, w = x.shape
+        
+        xx_range = torch.linspace(-1, 1, w, device=x.device)
+        yy_range = torch.linspace(-1, 1, h, device=x.device)
+        yy, xx = torch.meshgrid(yy_range, xx_range, indexing='ij')
+        grid = torch.stack([xx, yy], dim=0).unsqueeze(0).expand(b, -1, -1, -1)
+        
+        if x.shape[1] == 5:
+            x_encoder = torch.cat([x, edges], dim=1)
+        else:
+            x_encoder = torch.cat([x, grid, edges], dim=1)
+            
+        features = self.encoder(x_encoder)
+        
+        # e1 (die feinsten, lokalen Details) wird bewusst ignoriert, 
+        # um Wobbly Lines zu verhindern.
+        e2, e3, e4 = features[1], features[2], features[3]
+        
+        center = self.context_bot(e4)
+        
+        d1 = self.up1(center, e3)
+        d2 = self.up2(d1, e2)
+        
+        # Feature-Verfeinerung auf 32x32 Ebene
+        r1 = self.refine1(d2)
+        r2 = self.refine2(r1)
+        
+        # Sparse Prediction (B, 3, 32, 32)
+        out_sparse = self.final_sparse(r2)
+        
+        # Differentiables Upsampling auf Originalgröße (256x256)
+        # So musst du an Dataset, Loss oder vis_unet.py absolut nichts ändern.
+        out_dense = F.interpolate(out_sparse, size=(h, w), mode='bilinear', align_corners=True)
+        
+        return out_dense
 
 # --- 4. Loss with Gradients ---
 class PerceptualLoss(nn.Module):
@@ -776,7 +846,7 @@ class GeometricLoss(nn.Module):
     def forward(self, pred_logits, target, input_img):
         pred = torch.sigmoid(pred_logits)
         pred_uv = pred[:, :2, :, :]
-        pred_shading = pred[:, 3:4, :, :]
+        # pred_shading = pred[:, 3:4, :, :]
         pred_mask_logits = pred_logits[:, 2, :, :]
         
         # Unpack Target
@@ -814,9 +884,9 @@ class GeometricLoss(nn.Module):
         loss_grad_total = loss_grad_1 + loss_grad_2 + loss_grad_4
         
         # 4. Shading Loss
-        mask_expanded_shading = target_mask.unsqueeze(1)
-        loss_shading = self.l1(pred_shading, target_shading)
-        loss_shading = (loss_shading * mask_expanded_shading).sum() / (mask_expanded_shading.sum() + 1e-6)
+        # mask_expanded_shading = target_mask.unsqueeze(1)
+        # loss_shading = self.l1(pred_shading, target_shading)
+        # loss_shading = (loss_shading * mask_expanded_shading).sum() / (mask_expanded_shading.sum() + 1e-6)
         
         # 5. Reproj & VGG (Clean-to-Clean)
         grid_pred = pred_uv.permute(0, 2, 3, 1) * 2.0 - 1.0 
@@ -843,7 +913,7 @@ class GeometricLoss(nn.Module):
         
         # 6. Stiffness & TV & Rigid
         loss_stiffness = self.curvature_loss(pred_uv, mask_expanded)
-        loss_tv_shading = self.tv_shading_loss(pred_shading, target_mask.unsqueeze(1))
+        # loss_tv_shading = self.tv_shading_loss(pred_shading, target_mask.unsqueeze(1))
         loss_rigidity = self.jacobian_rigidity_loss(pred_uv, target_mask.unsqueeze(1))
 
         # 7. Structure Loss
@@ -853,9 +923,9 @@ class GeometricLoss(nn.Module):
             "Mask": loss_mask,
             "UV": loss_uv,
             "Grad": loss_grad_total,
-            "Shading": loss_shading,
+            "Shading": torch.tensor(0.0), # loss_shading,
             "Stiffness": loss_stiffness,
-            "TV": loss_tv_shading,
+            "TV": torch.tensor(0.0), # loss_tv_shading,
             "Rigid": loss_rigidity,
             "Reproj": loss_reproj,
             "MSSSIM": loss_msssim,
@@ -866,7 +936,8 @@ class GeometricLoss(nn.Module):
         components = {k: v.item() for k, v in component_tensors.items()}
 
         total_loss = sum(w * self.scales.get(k, 1.0) * component_tensors[k] for k, w in self.weights_dict.items()) / sum(self.weights_dict.values())
-        
+        # total_loss = sum(self.weights_dict.get(k, 0.0) * v for k, v in component_tensors.items()) / sum(self.weights_dict.values())
+
         debug_info = {
             "recon_masked": recon_masked,
             "pred_uv": pred_uv,
@@ -1023,8 +1094,8 @@ def train_unet(args):
     uvdoc_ds_train = UVDocUNetDataset(args.data_dir, 'train', transforms=transforms_train)
     uvdoc_ds_val = UVDocUNetDataset(args.data_dir, 'val')
     
-    datasets_train = [uvdoc_ds_train]
-    datasets_val = [uvdoc_ds_val]
+    datasets_train: list[Dataset] = [uvdoc_ds_train]
+    datasets_val: list[Dataset] = [uvdoc_ds_val]
     
     # B. Doc3D (New - Check if exists)
     doc3d_root = Path(args.doc3d_dir)
@@ -1045,7 +1116,8 @@ def train_unet(args):
     train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=4)
     
-    model = MobileNetV3UNet(num_classes=4).to(device)
+    # model = MobileNetV3UNet(num_classes=3).to(device) # temporarily removing shading prediction: num classes 4 => 3
+    model = FastViTUNet(num_classes=3).to(device)
     
     # --- Calibration / Scaling ---
     scales_path = Path(args.scales_file)
@@ -1120,8 +1192,10 @@ def train_unet(args):
             global_step += 1
             if global_step % args.log_interval == 0:
                 avg_comp = {k: v / args.log_interval for k, v in accumulated_components.items()}
+                avg_comp_scaled = {k: v * scales[k] * weights[k] for k, v in avg_comp.items()}
                 log_str = " | ".join([f"{k}: {v:.4f}" for k, v in avg_comp.items()])
-                print(f"Step {global_step} | {log_str}")
+                log_str_scaled = " | ".join([f"{k}: {v:.4f}" for k, v in avg_comp_scaled.items()])
+                print(f"Step {global_step}\n{log_str}\n{log_str_scaled}")
                 accumulated_components = {}
                 
                 if args.verbose and verbose_dir is not None:
@@ -1168,7 +1242,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", default="dataset_unet")
     parser.add_argument("--doc3d_dir", default="dataset_doc3d", help="Path to processed Doc3D dataset")
     parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument("--batch", type=int, default=48)
     parser.add_argument("--accumulate", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--use_vgg", action='store_true', help="Enable VGG perceptual loss (disabled by default to save VRAM)")
