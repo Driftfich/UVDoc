@@ -24,17 +24,17 @@ import timm
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 # define weights
-w_mask = 2.0 # Document Mask Loss
+w_mask = 1.0 # Document Mask Loss
 w_uv = 10.0 # UV + Canny Edge Loss => Dewarping and Edge Alignment Loss
-w_grad = 0.0 # 4.0 # Gradient Loss => Forces similar gradient in the GT and Predicted UV Map => Smoothness Loss
+w_grad = 4.0 # Gradient Loss => Forces similar gradient in the GT and Predicted UV Map => Smoothness Loss
 w_shading = 0.0 # Shading Loss => temporarily disabled
-w_stiffness = 0.0 # 2.0 # Stiffness Loss => Paper Curvature Assumption
+w_stiffness = 2.0 # Stiffness Loss => Paper Curvature Assumption
 w_tv_shading = 0.0 # TV Shading Loss => Shading Smoothness Loss => temporarily disabled
-w_rigidity = 0.0 # 2.0 # Jacobian Rigidity Loss => Local Uniformity in the Predicted UV Map => Wobbly Lines Fix
-w_structure = 0.0 # 8.0 # Structure Loss => Edge Alignment Loss
+w_rigidity = 2.0 # Jacobian Rigidity Loss => Local Uniformity in the Predicted UV Map => Wobbly Lines Fix
+w_structure = 8.0 # Structure Loss => Edge Alignment Loss
 
 # NEW: Content / Perceptual Losses (Replaces old 'Structure' loss)
-w_reproj = 10.0    # Pixel L1 diff between Unwarped Prediction and Flat GT
+w_reproj = 2.0    # Pixel L1 diff between Unwarped Prediction and Flat GT
 w_msssim = 0.0     # MS-SSIM Perceptual loss
 w_vgg = 0.0        # VGG Perceptual loss (Feature matching)
 
@@ -663,24 +663,45 @@ class FastViTUNet(nn.Module):
         
         self.sobel = SobelLayer()
         self.encoder = timm.create_model('fastvit_t8', pretrained=True, in_chans=6, features_only=True)
-        self.context_bot = ContextBlock(384, 64)
+        self.context_bot = ContextBlock(384, 128)
         
         # Upsampling nur noch bis 32x32
-        self.up1 = UpBlock(in_c=64, skip_c=192, out_c=128) # 8x8 -> 16x16
-        self.up2 = UpBlock(in_c=128, skip_c=96, out_c=64)  # 16x16 -> 32x32
+        self.up1 = UpBlock(in_c=128, skip_c=192, out_c=256) # 8x8 -> 16x16
+        self.up2 = UpBlock(in_c=256, skip_c=96, out_c=128)  # 16x16 -> 32x32
         
         # --- NEU: Kapazität erhalten, aber Auflösung klein halten ---
         # Ersetzt up3, up4 und up5. Verfeinert die 32x32 Features.
         self.refine1 = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1, bias=False),
+            nn.Conv2d(128, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
+        self.refine2 = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True)
         )
-        self.refine2 = nn.Sequential(
+
+        self.refine3 = nn.Sequential(
             nn.Conv2d(64, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+
+        self.refine4 = nn.Sequential(
+            nn.Conv2d(32, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True)
         )
@@ -716,9 +737,10 @@ class FastViTUNet(nn.Module):
         # Feature-Verfeinerung auf 32x32 Ebene
         r1 = self.refine1(d2)
         r2 = self.refine2(r1)
+        r3 = self.refine3(r2)
         
         # Sparse Prediction (B, 3, 32, 32)
-        out_sparse = self.final_sparse(r2)
+        out_sparse = self.final_sparse(r3)
         
         # Differentiables Upsampling auf Originalgröße (256x256)
         # So musst du an Dataset, Loss oder vis_unet.py absolut nichts ändern.
@@ -1242,7 +1264,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", default="dataset_unet")
     parser.add_argument("--doc3d_dir", default="dataset_doc3d", help="Path to processed Doc3D dataset")
     parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--batch", type=int, default=48)
+    parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--accumulate", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--use_vgg", action='store_true', help="Enable VGG perceptual loss (disabled by default to save VRAM)")

@@ -10,6 +10,7 @@ from tqdm import tqdm
 from scipy.interpolate import griddata
 import requests
 import zipfile
+import tarfile
 from typing import List, Tuple
 import orjson
 import torch
@@ -29,6 +30,15 @@ DOWNLOAD_DIR = Path("downloads")
 UVDOC_DATASET_DIR = Path("dataset_unet")
 DOC3D_DATASET_DIR = Path("dataset_doc3d")
 DOC3D_DIR = "StonyBrook-CVLab/doc3D-dataset"
+INV3D_DATASET_DIR = Path("dataset_inv3d")
+INV3D_URLS_TRAIN = [
+    "https://radar.kit.edu/radar-backend/archives/JnvMMjtvIjxpUpGz/versions/1/content",
+    "https://radar.kit.edu/radar-backend/archives/ihpFPDjGMMpcPcRF/versions/1/content",
+    "https://radar.kit.edu/radar-backend/archives/gbiTkBlCTWttcdlv/versions/1/content",
+    "https://radar.kit.edu/radar-backend/archives/loetxlbsNkFYeCjI/versions/1/content"
+]
+INV3D_URLS_VAL = ["https://radar.kit.edu/radar-backend/archives/GPweoqzKRRZGOAEE/versions/1/content"]
+INV3D_URLS_TEST = ["https://radar.kit.edu/radar-backend/archives/lvwLUTAbBhcjdTbB/versions/1/content"]
 
 def download_file(url, destination_path):
     """
@@ -77,6 +87,19 @@ def unzip_file(zip_path, extract_to, skip_dirs: List[str] = ["__MACOSX/"]):
             if any(name.startswith(dir) for dir in skip_dirs):
                 continue
             zip_ref.extract(member, extract_to)
+
+def untar_file(tar_path, extract_to, skip_dirs: List[str] = ["__MACOSX/"]):
+    """
+    Untars the archive.
+    """
+    print(f"Untaring {tar_path}...")
+    with tarfile.open(tar_path, 'r') as tar_ref:
+        members = tar_ref.getmembers()
+        for member in tqdm(members, total=len(members), desc="Extracting"):
+            name = member.name.lstrip("./")
+            if any(name.startswith(dir) for dir in skip_dirs):
+                continue
+            tar_ref.extract(member, extract_to)
 
 def load_mat_file(path):
     """Robustly loads a .mat file."""
@@ -650,13 +673,181 @@ def process_doc3d_dataset(raw_dir: Path, output_dir: Path, max_partitions: int =
 
     print("Done creating train/val split file.")
 
+def uncapsulate_inv3d_data(raw_dir: Path, mid_dir: Path):
+    """
+    1. Locates all the zip files in the raw_dir OR nested within mid_dir (after untarring)
+    2. Unzips the zip files into the mid_dir
+    3. Within the mid_dir, locate all dirs with format "\d{5}" (e.g. 00000)
+    4. For each dir, copy flat document (albedo), warped albedo, warped document (img) pngs and warped_UV.npz files 
+    5. Drop the doc_dirs and keep the mid_dirs
+    """
+    print("Uncapsulating INV3D data...")
+    
+    # 1. Check for zips in raw_dir (manual downloads)
+    zip_folders = list(raw_dir.rglob("*.zip"))
+    for zip_folder in tqdm(zip_folders, desc=f"Unzipping INV3D Zip Files into {raw_dir}"):
+        unzip_file(zip_folder, mid_dir, skip_dirs=[])
+    
+    # in paths/names
+    flat_alb_name = "flat_document.png"
+    warped_alb_name = "warped_albedo.png"
+    warped_img_name = "warped_document.png"
+    warped_UV_name = "warped_UV.npz"
+
+    # create dirs in mid_dir for saving raw data/img (needed for testing)
+    mid_flat_alb = mid_dir / "flat_alb"
+    mid_warped_alb = mid_dir / "warped_alb"
+    mid_img = mid_dir / "img"
+    mid_uv = mid_dir / "uv"
+
+    mid_flat_alb.mkdir(parents=True, exist_ok=True)
+    mid_warped_alb.mkdir(parents=True, exist_ok=True)
+    mid_img.mkdir(parents=True, exist_ok=True)
+    mid_uv.mkdir(parents=True, exist_ok=True)
+    
+    # Locate all dirs within mid_dir with format 5 digits and copy the data to the mid_dirs
+    # Using glob pattern for 5 digits [0-9][0-9][0-9][0-9][0-9]
+    # search recursively in case unzip didn't flatten them
+    doc_dirs = list(mid_dir.rglob("[0-9][0-9][0-9][0-9][0-9]"))
+    for doc_dir in tqdm(doc_dirs, desc="Processing INV3D Document Dirs"):
+        # create paths
+        flat_alb_path = doc_dir / flat_alb_name
+        warped_alb_path = doc_dir / warped_alb_name
+        warped_img_path = doc_dir / warped_img_name
+        warped_UV_path = doc_dir / warped_UV_name
+
+        if all([flat_alb_path.exists(), warped_alb_path.exists(), warped_img_path.exists(), warped_UV_path.exists()]):
+            # copy the data to the mid_dirs
+            shutil.copy(str(flat_alb_path), str(mid_flat_alb / f"{doc_dir.name}.png"))
+            shutil.copy(str(warped_alb_path), str(mid_warped_alb / f"{doc_dir.name}.png"))
+            shutil.copy(str(warped_img_path), str(mid_img / f"{doc_dir.name}.png"))
+            shutil.copy(str(warped_UV_path), str(mid_uv / f"{doc_dir.name}.npz"))
+
+    # drop the doc_dirs and keep the mid_dirs
+    # Be careful not to delete mid_dirs themselves if they match the pattern (unlikely)
+    for d in doc_dirs:
+        if d.is_dir() and d.name.isdigit():
+            shutil.rmtree(d)
+
+    print("Done uncapsulating INV3D data.")
+
+def process_inv3d_data(mid_dir: Path, output_dir: Path):
+    """
+    1. Process the data in mid_dir and save the processed data to the output_dir
+    """
+    print("Processing INV3D data...")
+    
+    # create dirs in output_dir for saving processed data
+    out_flat_alb = output_dir / "flat_alb"
+    out_warped_alb = output_dir / "warped_alb"
+    out_img = output_dir / "img"
+    out_uv = output_dir / "uv"
+    out_shading = output_dir / "shading"
+
+    for d in [out_flat_alb, out_warped_alb, out_img, out_uv, out_shading]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    mid_flat_alb = mid_dir / "flat_alb"
+    mid_warped_alb = mid_dir / "warped_alb"
+    mid_img = mid_dir / "img"
+    mid_uv = mid_dir / "uv"
+
+    flat_alb_files = np.array([f.stem for f in mid_flat_alb.glob("*.png")])
+    warped_alb_files = np.array([f.stem for f in mid_warped_alb.glob("*.png")])
+    img_files = np.array([f.stem for f in mid_img.glob("*.png")])
+    uv_files = np.array([f.stem for f in mid_uv.glob("*.npz")])
+
+    stems = np.intersect1d(np.intersect1d(np.intersect1d(flat_alb_files, warped_alb_files), img_files), uv_files)
+
+    for stem in tqdm(stems, desc="Processing INV3D Data"):
+        flat_alb_path = mid_flat_alb / f"{stem}.png"
+        warped_alb_path = mid_warped_alb / f"{stem}.png"
+        img_path = mid_img / f"{stem}.png"
+        uv_path = mid_uv / f"{stem}.npz"
+
+        flat_alb = cv2.imread(str(flat_alb_path))
+        warped_alb = cv2.imread(str(warped_alb_path))
+        img = cv2.imread(str(img_path))
+        
+        # .npz contains multiple arrays, usually 'uv' or similar. 
+        # But if you saved it as .npy, then np.load is enough. 
+        # If it's a .npz, you need to access the array inside.
+        with np.load(str(uv_path)) as data:
+            # According to Inv3D, it's 'warped_UV.npz'
+            # Let's assume the key is 'uv' or 'arr_0' or 'warped_UV'
+            # Based on common practices, it might be the first file.
+            uv = data[data.files[0]]
+
+        # resize the images to TARGET_SIZE
+        flat_alb = cv2.resize(flat_alb, TARGET_SIZE)
+        warped_alb = cv2.resize(warped_alb, TARGET_SIZE)
+        img = cv2.resize(img, TARGET_SIZE)
+        uv = cv2.resize(uv, TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
+
+        # Standardize INV3D UV [mask, V_flipped, U] to [U, V, mask]
+        # To match Doc3D/UVDoc encoding used in this script
+        inv_mask = uv[..., 0]
+        inv_v_flipped = uv[..., 1]
+        inv_u = uv[..., 2]
+        
+        v = 1.0 - inv_v_flipped
+        u = inv_u
+        
+        # New UV: [U, V, mask]
+        uv_standard = np.stack([u, v, inv_mask], axis=-1)
+
+        # create shading img from wrapped alb img and original img
+        gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        gray_alb = cv2.cvtColor(warped_alb, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+
+        # Mask: Valid pixels where UV map is non-zero
+        mask = inv_mask.astype(np.float32)
+        
+        # Calculate shading: Image = Albedo * Shading => Shading = Image / Albedo + 1e-6
+        shading = gray_img / (gray_alb + 1e-6)
+        
+        # Clip to [0, 1]
+        shading = np.clip(shading, 0, 1)
+        
+        # Apply mask: Set background to 0
+        shading = shading * mask
+
+        shading_u8 = (shading * 255).astype(np.uint8)
+
+        cv2.imwrite(str(out_shading / f"{stem}.png"), shading_u8)
+        cv2.imwrite(str(out_img / f"{stem}.png"), img)
+        cv2.imwrite(str(out_warped_alb / f"{stem}.png"), warped_alb)
+        cv2.imwrite(str(out_flat_alb / f"{stem}.png"), flat_alb)
+        
+        # save uv as npy
+        np.save(str(out_uv / f"{stem}.npy"), uv_standard)
+
+    print("Done processing INV3D data.")
+
+def create_inv3d_dataset(raw_dir: Path, mid_dir: Path, output_dir: Path):
+    """
+    1. Uncapsulate the INV3D data into the mid_dir in a clear structure
+    2. Process the data in mid_dir and save the processed data to the output_dir
+    """
+
+    print("Create INV3D dataset...")
+
+    # uncapsulate the INV3D data into the mid_dir in a clear structure
+    uncapsulate_inv3d_data(raw_dir, mid_dir)
+
+    process_inv3d_data(mid_dir, output_dir)
+
+    return   
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw_dir", default=DOWNLOAD_DIR)
     parser.add_argument("--uvdoc_out_dir", default=UVDOC_DATASET_DIR)
     parser.add_argument("--doc3d_out_dir", default=DOC3D_DATASET_DIR)
+    parser.add_argument("--inv3d_out_dir", default=INV3D_DATASET_DIR)
     parser.add_argument("--url", default=DATASET_URL)
     parser.add_argument("--doc3d_dir", default=DOC3D_DIR)
+    parser.add_argument("--skip_doc3d", action='store_true')
 
     args = parser.parse_args()
     
@@ -684,20 +875,59 @@ def main():
     print("Done with UVDoc dataset.")
 
     # download Doc3D from huggingface
-    print(f"Downloading Doc3D from huggingface {args.doc3d_dir}...")
-    # number of partitions to download from all available 21 Doc3D partitions
-    max_partitions = 10
-    patterns = []
-    for cat in ["img", "alb", "bm", "uv"]:
-        for i in range(1, max_partitions + 1):
-            patterns.append(f"doc3d/{cat}_{i}.zip")
-        
-    # downloads max partitions of img_n.zip, alb_n.zip, bm_n.zip, uv_n.zip
-    print(f"Downloading {patterns} from {args.doc3d_dir}...")
-    doc3d_dir = snapshot_download(repo_id=args.doc3d_dir, local_dir=raw, allow_patterns=patterns, repo_type="dataset")
+    if not args.skip_doc3d:
+        print(f"Downloading Doc3D from huggingface {args.doc3d_dir}...")
+        # number of partitions to download from all available 21 Doc3D partitions
+        max_partitions = 8
+        patterns = []
+        for cat in ["img", "alb", "bm", "uv"]:
+            for i in range(1, max_partitions + 1):
+                patterns.append(f"doc3d/{cat}_{i}.zip")
+            
+        # downloads max partitions of img_n.zip, alb_n.zip, bm_n.zip, uv_n.zip
+        print(f"Downloading {patterns} from {args.doc3d_dir}...")
+        doc3d_dir = snapshot_download(repo_id=args.doc3d_dir, local_dir=raw, allow_patterns=patterns, repo_type="dataset")
 
-    process_doc3d_dataset(raw, Path(args.doc3d_out_dir), max_partitions)
+        process_doc3d_dataset(raw, Path(args.doc3d_out_dir), max_partitions)
+    else:
+        print("Skipping Doc3D dataset.")
 
+    raw = Path("/media/driftfich/Backup-Volume/downloads")
+    raw.mkdir(parents=True, exist_ok=True)
+    download_dir = raw / INV3D_DATASET_DIR / "raw"
+    download_train_dir = download_dir / "train"
+    download_val_dir = download_dir / "val"
+    download_test_dir = download_dir / "test"
+    download_train_dir.mkdir(parents=True, exist_ok=True)
+    download_val_dir.mkdir(parents=True, exist_ok=True)
+    download_test_dir.mkdir(parents=True, exist_ok=True)
+
+    unzipped_dir = raw / INV3D_DATASET_DIR / "unzipped"
+    unzipped_train_dir = unzipped_dir / "train"
+    unzipped_val_dir = unzipped_dir / "val"
+    unzipped_test_dir = unzipped_dir / "test"
+    unzipped_train_dir.mkdir(parents=True, exist_ok=True)
+    unzipped_val_dir.mkdir(parents=True, exist_ok=True)
+    unzipped_test_dir.mkdir(parents=True, exist_ok=True)
+
+    inv3d_train_partitions: int = 1
+    inv3d_val_partitions: int = 0
+    inv3d_test_partitions: int = 0
+
+    for i in range(min(inv3d_train_partitions, len(INV3D_URLS_TRAIN))):
+        download_file(INV3D_URLS_TRAIN[i], raw / INV3D_DATASET_DIR / "raw" / "train" / f"inv3d_train_{i}.tar")
+        untar_file(raw / INV3D_DATASET_DIR / "raw" / "train" / f"inv3d_train_{i}.tar", raw / INV3D_DATASET_DIR / "unzipped" / "train")
+
+    for i in range(min(inv3d_val_partitions, len(INV3D_URLS_VAL))):
+        download_file(INV3D_URLS_VAL[i], raw / INV3D_DATASET_DIR / "raw" / "val" / f"inv3d_val_{i}.tar")
+        untar_file(raw / INV3D_DATASET_DIR / "raw" / "val" / f"inv3d_val_{i}.tar", raw / INV3D_DATASET_DIR / "unzipped" / "val")
+
+    for i in range(min(inv3d_test_partitions, len(INV3D_URLS_TEST))):
+        download_file(INV3D_URLS_TEST[i], raw / INV3D_DATASET_DIR / "raw" / "test" / f"inv3d_test_{i}.tar")
+        untar_file(raw / INV3D_DATASET_DIR / "raw" / "test" / f"inv3d_test_{i}.tar", raw / INV3D_DATASET_DIR / "unzipped" / "test")
+
+    for t in ["train", "val", "test"]:
+        create_inv3d_dataset(raw / INV3D_DATASET_DIR / "unzipped" / t, raw / INV3D_DATASET_DIR / "processed" / t, INV3D_DATASET_DIR)
 
 
 if __name__ == "__main__":
