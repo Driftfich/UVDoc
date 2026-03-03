@@ -75,7 +75,7 @@ def download_file(url, destination_path):
         print(f"Error downloading: {e}")
         print("Please download the 'UVDoc_final.zip' manually and place it in the 'downloads' folder.")
 
-def unzip_file(zip_path, extract_to, skip_dirs: List[str] = ["__MACOSX/"]):
+def unzip_file(zip_path, extract_to, skip_dirs: List[str] = ["__MACOSX/"], delete_after: bool = True):
     """
     Unzips the archive.
     """
@@ -87,8 +87,11 @@ def unzip_file(zip_path, extract_to, skip_dirs: List[str] = ["__MACOSX/"]):
             if any(name.startswith(dir) for dir in skip_dirs):
                 continue
             zip_ref.extract(member, extract_to)
+    if delete_after:
+        os.remove(zip_path)
+        print(f"Deleted {zip_path}")
 
-def untar_file(tar_path, extract_to, skip_dirs: List[str] = ["__MACOSX/"]):
+def untar_file(tar_path, extract_to, skip_dirs: List[str] = ["__MACOSX/"], delete_after: bool = True):
     """
     Untars the archive.
     """
@@ -100,6 +103,9 @@ def untar_file(tar_path, extract_to, skip_dirs: List[str] = ["__MACOSX/"]):
             if any(name.startswith(dir) for dir in skip_dirs):
                 continue
             tar_ref.extract(member, extract_to)
+    if delete_after:
+        os.remove(tar_path)
+        print(f"Deleted {tar_path}")
 
 def load_mat_file(path):
     """Robustly loads a .mat file."""
@@ -448,7 +454,7 @@ def reconstruct_flat_albedo_tensor(alb, bm):
     return cv2.cvtColor(flat_albedo_u8, cv2.COLOR_RGB2BGR)
 
 
-def process_doc3d_dataset(raw_dir: Path, output_dir: Path, max_partitions: int = 3):
+def process_doc3d_dataset(raw_dir: Path, output_dir: Path, max_partitions: int = 3, clean: bool = True):
     """
     1. Unzips the Doc3D dataset into the unzipped dir (raw_dir / "doc3d_raw")
     2. flattens out the partitions into the category dirs (unzipped_dir / "img", "alb", "bm", "uv")
@@ -456,6 +462,7 @@ def process_doc3d_dataset(raw_dir: Path, output_dir: Path, max_partitions: int =
     4. creates the flat albedo and shading images
     5. create train/val split file with random 80/20 split
     6. normalizes uv map shape
+    clean: if True, delete high resolution data not needed for training or testing
     """
 
     print("Processing Doc3D dataset...")
@@ -671,6 +678,11 @@ def process_doc3d_dataset(raw_dir: Path, output_dir: Path, max_partitions: int =
     with open(split_path, "w") as f:
         f.write(orjson.dumps(train_val_split).decode("utf-8"))
 
+    if clean:
+        # delete doc3d_raw bm and uv
+        shutil.rmtree(raw_dir / "bm")
+        shutil.rmtree(raw_dir / "uv")
+
     print("Done creating train/val split file.")
 
 def uncapsulate_inv3d_data(raw_dir: Path, mid_dir: Path):
@@ -731,9 +743,10 @@ def uncapsulate_inv3d_data(raw_dir: Path, mid_dir: Path):
 
     print("Done uncapsulating INV3D data.")
 
-def process_inv3d_data(mid_dir: Path, output_dir: Path):
+def process_inv3d_data(mid_dir: Path, output_dir: Path, clean: bool = True):
     """
-    1. Process the data in mid_dir and save the processed data to the output_dir
+    Process the data in mid_dir and save the processed data to the output_dir
+    clean: if True, delete high resolution data not needed for training or testing
     """
     print("Processing INV3D data...")
     
@@ -822,6 +835,12 @@ def process_inv3d_data(mid_dir: Path, output_dir: Path):
         # save uv as npy
         np.save(str(out_uv / f"{stem}.npy"), uv_standard)
 
+    if clean:
+        # delete mid_flat_alb, mid_warped_alb, mid_uv (mid_img is needed for testing)
+        shutil.rmtree(mid_flat_alb)
+        shutil.rmtree(mid_warped_alb)
+        shutil.rmtree(mid_uv)
+
     print("Done processing INV3D data.")
 
 def create_inv3d_dataset(raw_dir: Path, mid_dir: Path, output_dir: Path):
@@ -837,7 +856,7 @@ def create_inv3d_dataset(raw_dir: Path, mid_dir: Path, output_dir: Path):
 
     process_inv3d_data(mid_dir, output_dir)
 
-    return   
+    return
 
 def main():
     parser = argparse.ArgumentParser()
@@ -914,21 +933,15 @@ def main():
     inv3d_val_partitions: int = 0
     inv3d_test_partitions: int = 0
 
-    for i in range(min(inv3d_train_partitions, len(INV3D_URLS_TRAIN))):
-        download_file(INV3D_URLS_TRAIN[i], raw / INV3D_DATASET_DIR / "raw" / "train" / f"inv3d_train_{i}.tar")
-        untar_file(raw / INV3D_DATASET_DIR / "raw" / "train" / f"inv3d_train_{i}.tar", raw / INV3D_DATASET_DIR / "unzipped" / "train")
-
-    for i in range(min(inv3d_val_partitions, len(INV3D_URLS_VAL))):
-        download_file(INV3D_URLS_VAL[i], raw / INV3D_DATASET_DIR / "raw" / "val" / f"inv3d_val_{i}.tar")
-        untar_file(raw / INV3D_DATASET_DIR / "raw" / "val" / f"inv3d_val_{i}.tar", raw / INV3D_DATASET_DIR / "unzipped" / "val")
-
-    for i in range(min(inv3d_test_partitions, len(INV3D_URLS_TEST))):
-        download_file(INV3D_URLS_TEST[i], raw / INV3D_DATASET_DIR / "raw" / "test" / f"inv3d_test_{i}.tar")
-        untar_file(raw / INV3D_DATASET_DIR / "raw" / "test" / f"inv3d_test_{i}.tar", raw / INV3D_DATASET_DIR / "unzipped" / "test")
-
-    for t in ["train", "val", "test"]:
-        create_inv3d_dataset(raw / INV3D_DATASET_DIR / "unzipped" / t, raw / INV3D_DATASET_DIR / "processed" / t, INV3D_DATASET_DIR)
-
+    for t, c, u in zip(["train", "val", "test"], [inv3d_train_partitions, inv3d_val_partitions, inv3d_test_partitions], [INV3D_URLS_TRAIN, INV3D_URLS_VAL, INV3D_URLS_TEST]):
+        for i in range(min(c, len(u))):
+            download_file(u[i], raw / INV3D_DATASET_DIR / "raw" / t / f"inv3d_{t}_{i}.tar")
+            untar_file(raw / INV3D_DATASET_DIR / "raw" / t / f"inv3d_{t}_{i}.tar", raw / INV3D_DATASET_DIR / "unzipped" / t)
+            # create_inv3d_dataset(raw / INV3D_DATASET_DIR / "unzipped" / t, raw / INV3D_DATASET_DIR / "processed" / t, INV3D_DATASET_DIR / t)
+            uncapsulate_inv3d_data(raw / INV3D_DATASET_DIR / "unzipped" / t, raw / INV3D_DATASET_DIR / "processed" / t)
+            # remove the content of the unzipped dir
+            shutil.rmtree(raw / INV3D_DATASET_DIR / "unzipped" / t)
+        process_inv3d_data(raw / INV3D_DATASET_DIR / "processed" / t, INV3D_DATASET_DIR / t)
 
 if __name__ == "__main__":
     main()
