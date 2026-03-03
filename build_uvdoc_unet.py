@@ -872,7 +872,7 @@ def main():
     
     raw = Path(args.raw_dir)
     uvdoc_out_dir = Path(args.uvdoc_out_dir)
-    url = args.url
+    urls = args.url
     
     # Ensure directories exist
     raw.mkdir(parents=True, exist_ok=True)
@@ -882,7 +882,7 @@ def main():
     if not (raw / "UVDoc_final").exists():
         if not (raw / "UVDoc_final.zip").exists():
             print("UVDoc_final.zip not found. Downloading...")
-            download_file(url, raw / "UVDoc_final.zip")
+            download_file(urls, raw / "UVDoc_final.zip")
         
         unzip_file(raw / "UVDoc_final.zip", raw)
         print("UVDoc_final dir downloaded and unzipped.")
@@ -933,15 +933,13 @@ def main():
     inv3d_val_partitions: int = 0
     inv3d_test_partitions: int = 0
 
-    for t, c, u in zip(["train", "val", "test"], [inv3d_train_partitions, inv3d_val_partitions, inv3d_test_partitions], [INV3D_URLS_TRAIN, INV3D_URLS_VAL, INV3D_URLS_TEST]):
-        for i in range(min(c, len(u))):
-            download_file(u[i], raw / INV3D_DATASET_DIR / "raw" / t / f"inv3d_{t}_{i}.tar")
-            untar_file(raw / INV3D_DATASET_DIR / "raw" / t / f"inv3d_{t}_{i}.tar", raw / INV3D_DATASET_DIR / "unzipped" / t)
-            # create_inv3d_dataset(raw / INV3D_DATASET_DIR / "unzipped" / t, raw / INV3D_DATASET_DIR / "processed" / t, INV3D_DATASET_DIR / t)
-            uncapsulate_inv3d_data(raw / INV3D_DATASET_DIR / "unzipped" / t, raw / INV3D_DATASET_DIR / "processed" / t)
+    for part, count, urls in zip(["train", "val", "test"], [inv3d_train_partitions, inv3d_val_partitions, inv3d_test_partitions], [INV3D_URLS_TRAIN, INV3D_URLS_VAL, INV3D_URLS_TEST]):
+        for i in range(min(count, len(urls))):
+            download_file(urls[i], raw / INV3D_DATASET_DIR / "raw" / part / f"inv3d_{part}_{i}.tar")
+            untar_file(raw / INV3D_DATASET_DIR / "raw" / part / f"inv3d_{part}_{i}.tar", raw / INV3D_DATASET_DIR / "unzipped" / part / f"inv3d_{part}_{i}")
+            create_inv3d_dataset(raw / INV3D_DATASET_DIR / "unzipped" / part / f"inv3d_{part}_{i}", raw / INV3D_DATASET_DIR / "processed" / part / f"inv3d_{part}_{i}", INV3D_DATASET_DIR / part)
             # remove the content of the unzipped dir
-            shutil.rmtree(raw / INV3D_DATASET_DIR / "unzipped" / t)
-        process_inv3d_data(raw / INV3D_DATASET_DIR / "processed" / t, INV3D_DATASET_DIR / t)
+            shutil.rmtree(raw / INV3D_DATASET_DIR / "unzipped" / part / f"inv3d_{part}_{i}")
 
 if __name__ == "__main__":
     main()
