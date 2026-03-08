@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
-from train_unet import Doc3DDataset, UVDocUNetDataset, get_train_transforms
+from train_unet import Doc3DDataset, UVDocUNetDataset, Inv3Dataset, get_train_transforms
 
 
 class LabeledDataset(Dataset):
@@ -140,6 +140,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--uvdoc_dir", default="dataset_unet")
     parser.add_argument("--doc3d_dir", default="dataset_doc3d")
+    parser.add_argument("--inv3d_dir", default="dataset_inv3d")
     parser.add_argument("--split", default="train", choices=["train", "val"])
     parser.add_argument("--batch", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -166,6 +167,11 @@ def main():
     if doc3d_root.exists():
         doc3d = Doc3DDataset(args.doc3d_dir, args.split, transforms=transforms_train)
         datasets.append(LabeledDataset(doc3d, "doc3d"))
+
+    inv3d_root = Path(args.inv3d_dir)
+    if inv3d_root.exists():
+        inv3d = Inv3Dataset(args.inv3d_dir, args.split, transforms=transforms_train)
+        datasets.append(LabeledDataset(inv3d, "inv3d"))
 
     concat_ds = ConcatDataset(datasets)
     loader = DataLoader(

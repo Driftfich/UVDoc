@@ -6,6 +6,7 @@
 *.pt
 *.gif
 *.png
+*.npy
 /export_output/
 /testapp/.idea/
 /.idea/

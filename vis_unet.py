@@ -7,6 +7,7 @@ from pathlib import Path
 from train_unet import MobileNetV3UNet, FastViTUNet, UVDocUNetDataset
 from scipy.interpolate import griddata
 from tqdm import tqdm
+from typing import Union
 import orjson 
 
 class TPSSolver:
@@ -144,6 +145,94 @@ class TPSSolver:
         
         return res.cpu().numpy()
 
+def axis_alignment_preprocessing(model, img_orig, device, expand_ratio=0.05):
+    """
+    Richtet das Dokument vor der eigentlichen Entzerrung grob aus und schneidet es zu.
+    Basiert auf der vorhergesagten Maske und dem Minimum-Area-Rectangle.
+    """
+    h_orig, w_orig = img_orig.shape[:2]
+    
+    # Schneller Forward-Pass für die Maske
+    img_resized = cv2.resize(img_orig, (256, 256))
+    img_norm = img_resized.astype(np.float32) / 255.0
+    img_ch = np.transpose(img_norm, (2, 0, 1))
+
+    h, w = 256, 256
+    xx = np.arange(w, dtype=np.float32)
+    yy = np.arange(h, dtype=np.float32)
+    xx, yy = np.meshgrid(xx, yy)
+    xx = xx / (w - 1) * 2 - 1
+    yy = yy / (h - 1) * 2 - 1
+    grid = np.stack([xx, yy], axis=0)
+    
+    input_np = np.concatenate([img_ch, grid], axis=0)
+    input_tensor = torch.from_numpy(input_np).unsqueeze(0).to(device)
+    
+    with torch.no_grad():
+        pred_logits = model(input_tensor)
+        pred = torch.sigmoid(pred_logits)
+    
+    # Maske extrahieren und auf 0-255 skalieren
+    mask_pred = pred[0, 2].cpu().numpy()
+    mask_pred_u8 = (mask_pred * 255).astype(np.uint8)
+    
+    # Guided Filter anwenden (Guide-Bild ist der graue 256x256 Input)
+    guide = cv2.cvtColor(img_resized, cv2.COLOR_RGB2GRAY)
+    refined_mask = cv2.ximgproc.guidedFilter(guide=guide, src=mask_pred_u8, radius=8, eps=50)
+    
+    # Die verfeinerte Maske binarisieren
+    mask_bin = (refined_mask > 127).astype(np.uint8) * 255
+    
+    contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return img_orig # Fallback, falls keine Kontur gefunden wird
+        
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 100:
+        return img_orig
+        
+    # Minimum Area Rectangle (rotiertes Rechteck)
+    rect = cv2.minAreaRect(largest)
+    box = cv2.boxPoints(rect)
+    
+    # Eckpunkte wieder auf die Originalauflösung hochskalieren
+    box[:, 0] *= (w_orig / 256.0)
+    box[:, 1] *= (h_orig / 256.0)
+    
+    # Punkte sortieren: Top-Left, Top-Right, Bottom-Right, Bottom-Left
+    rect_pts = np.zeros((4, 2), dtype="float32")
+    s = box.sum(axis=1)
+    rect_pts[0] = box[np.argmin(s)]
+    rect_pts[2] = box[np.argmax(s)]
+    diff = np.diff(box, axis=1)
+    rect_pts[1] = box[np.argmin(diff)]
+    rect_pts[3] = box[np.argmax(diff)]
+    
+    (tl, tr, br, bl) = rect_pts
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxWidth = max(int(widthA), int(widthB))
+    
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxHeight = max(int(heightA), int(heightB))
+    
+    # Etwas Padding hinzufügen (expand_ratio), damit keine Ecken abgeschnitten werden
+    pad_x = int(maxWidth * expand_ratio)
+    pad_y = int(maxHeight * expand_ratio)
+    
+    dst_padded = np.array([
+        [pad_x, pad_y],
+        [maxWidth + pad_x - 1, pad_y],
+        [maxWidth + pad_x - 1, maxHeight + pad_y - 1],
+        [pad_x, maxHeight + pad_y - 1]
+    ], dtype="float32")
+    
+    M = cv2.getPerspectiveTransform(rect_pts, dst_padded)
+    warped = cv2.warpPerspective(img_orig, M, (maxWidth + 2*pad_x, maxHeight + 2*pad_y))
+    
+    return warped
+
 def refine_lattice(back_map_x, back_map_y, mask_pred_bin, method='gaussian'):
     """
     Refines the backward mapping (H, W).
@@ -176,12 +265,17 @@ def refine_lattice(back_map_x, back_map_y, mask_pred_bin, method='gaussian'):
     return back_map_x, back_map_y
 
 
-def infer_high_res(model, img_path, device='cpu', num_points=2500, method='griddata', refine=False):
-    img_orig = cv2.imread(str(img_path))
-    if img_orig is None:
-        print(f"Could not load {img_path}")
-        return None, None, None, None, None, None
-    img_orig = cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB)
+def infer_high_res(model, img_input: Union[str, Path, np.ndarray], device='cpu', num_points=2500, method='griddata', refine=False):
+    # NEU: Unterscheide zwischen Dateipfad und Numpy-Array
+    if isinstance(img_input, (str, Path)):
+        img_orig = cv2.imread(str(img_input))
+        if img_orig is None:
+            print(f"Could not load {img_input}")
+            return None, None, None, None, None, None
+        img_orig = cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB)
+    else:
+        img_orig = img_input.copy()
+        
     h_orig, w_orig = img_orig.shape[:2]
     
     # 2. Resize for Model (256x256)
@@ -376,9 +470,9 @@ def infer_high_res(model, img_path, device='cpu', num_points=2500, method='gridd
     dst_xs = u_mapped[valid_fwd]
     forward_warp[dst_ys, dst_xs] = img_orig[ys, xs]
     
-    return img_orig, dewarped_orig, dewarped_orig, dewarped_albedo, uv_vis, forward_warp # temporarily removing shading_high
+    return img_orig, dewarped_orig, dewarped_orig, dewarped_albedo, uv_vis, forward_warp, map_x, map_y # temporarily removing shading_high
 
-def visualize_results(model_path, uvdoc_dir, doc3d_dir, uvdoc_raw_dir, doc3d_raw_dir, out_dir, num_samples=3, device='cpu', points=2500, method='griddata', refine=False):
+def visualize_results(model_path, uvdoc_dir, doc3d_dir, uvdoc_raw_dir, doc3d_raw_dir, out_dir, num_samples=3, device='cpu', points=2500, method='griddata', refine=False, preprocess=True, steps=1):
     
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -419,25 +513,68 @@ def visualize_results(model_path, uvdoc_dir, doc3d_dir, uvdoc_raw_dir, doc3d_raw
         stem = path.stem
         
         print(f"Processing {path.name}...")
-        orig, res, shading, albedo, uv_vis, fwd_warp = infer_high_res(
-            model, name, device, points, method, refine
-        )
+        orig_img = cv2.imread(str(path))
+        if orig_img is None: continue
+        orig_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
         
+        current_img = orig_img
+        preprocessed_img = None
+        
+        # --- Schritt 1: Preprocessing ---
+        if preprocess:
+            print("  Running Axis Alignment Preprocessing...")
+            current_img = axis_alignment_preprocessing(model, current_img, device)
+            preprocessed_img = current_img.copy()
+            
+        base_img = preprocessed_img if preprocess else orig_img
+        cum_map_x = None
+        cum_map_y = None
+        
+        # --- Schritt 2: Iteratives Unwarping ---
+        for step in range(steps):
+            if steps > 1:
+                print(f"  Running Unwarping Step {step+1}/{steps}...")
+                
+            _, _, _, _, uv_vis, fwd_warp, map_x, map_y = infer_high_res(
+                model, current_img, device, points, method, refine
+            )
+            
+            if map_x is None: break
+            
+            # Transformationen akkumulieren
+            if cum_map_x is None:
+                cum_map_x = map_x
+                cum_map_y = map_y
+            else:
+                cum_map_x = cv2.remap(cum_map_x, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                cum_map_y = cv2.remap(cum_map_y, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                
+            # Immer aus dem scharfen Basis-Bild samplen
+            base_float = base_img.astype(np.float32) / 255.0
+            res = cv2.remap(base_float, cum_map_x, cum_map_y, interpolation=cv2.INTER_LINEAR)
+            
+            # Pixel außerhalb des Dokuments schwärzen
+            h_orig, w_orig = base_img.shape[:2]
+            mask_valid = (cum_map_x >= 0) & (cum_map_x <= w_orig-1) & (cum_map_y >= 0) & (cum_map_y <= h_orig-1)
+            res[~mask_valid] = 0
+            
+            albedo = res.copy()
+            current_img = (res * 255).clip(0, 255).astype(np.uint8)
+        
+        # --- Visualisierung ---
         if res is not None:
             out_name = f"vis_highres_{stem}.png"
-            h, w = orig.shape[:2]
+            h = orig_img.shape[0] # Wir richten alles an der Originalhöhe aus
             
-            scale = h / res.shape[0]
-            new_w = int(res.shape[1] * scale)
+            def resize_to_h(img, target_h):
+                scale = target_h / img.shape[0]
+                new_w = int(img.shape[1] * scale)
+                return cv2.resize(img, (new_w, target_h))
             
-            res_disp = cv2.resize(res, (new_w, h))
-            albedo_disp = cv2.resize(albedo, (new_w, h))
-            fwd_warp_disp = cv2.resize(fwd_warp, (new_w, h))
-            
-            # shading_disp = (shading.squeeze(-1) * 255).astype(np.uint8)
-            # shading_disp = cv2.resize(shading_disp, (w, h))
-            # # Convert grayscale to RGB for stacking
-            # shading_disp = cv2.cvtColor(shading_disp, cv2.COLOR_GRAY2RGB)
+            res_disp = resize_to_h(res, h)
+            albedo_disp = resize_to_h(albedo, h)
+            fwd_warp_disp = resize_to_h(fwd_warp, h)
+            uv_vis_disp = resize_to_h(uv_vis, h)
             
             def add_label(img, text):
                 img = img.astype(np.uint8).copy()
@@ -445,15 +582,21 @@ def visualize_results(model_path, uvdoc_dir, doc3d_dir, uvdoc_raw_dir, doc3d_raw
                             1.5, (0, 0, 255), 3, cv2.LINE_AA)
                 return img
             
-            img1 = add_label(orig, "1. Original")
-            img2 = add_label(uv_vis, "2. UV Grid (Pred)")
-            img3 = add_label(fwd_warp_disp, "3. Fwd Warp (Raw)")
-            img4 = add_label((res_disp * 255).astype(np.uint8), f"4. Dewarped ({method})")
-            # img5 = add_label(shading_disp, "5. Shading")
-            img6 = add_label((albedo_disp * 255).astype(np.uint8), "6. Albedo (Result)")
+            stack = [add_label(orig_img, "1. Original")]
             
-            combined = np.hstack([img1, img2, img3, img4, img6])
-            cv2.imwrite(out_dir / out_name, cv2.cvtColor(combined, cv2.COLOR_RGB2BGR))
+            if preprocess:
+                pre_disp = resize_to_h(preprocessed_img, h)
+                stack.append(add_label(pre_disp, "1.b Preprocessed"))
+                
+            stack.extend([
+                add_label(uv_vis_disp, "2. UV Grid (Final)"),
+                add_label(fwd_warp_disp, "3. Fwd Warp"),
+                add_label((res_disp * 255).astype(np.uint8), f"4. Dewarped ({steps} steps)"),
+                add_label((albedo_disp * 255).astype(np.uint8), "5. Albedo")
+            ])
+            
+            combined = np.hstack(stack)
+            cv2.imwrite(str(out_dir / out_name), cv2.cvtColor(combined, cv2.COLOR_RGB2BGR))
             print(f"Saved {out_dir / out_name}")
 
 if __name__ == "__main__":
@@ -469,6 +612,8 @@ if __name__ == "__main__":
     parser.add_argument("--method", default="tps", choices=['griddata', 'tps'], help="Interpolation method")
     parser.add_argument("--refine", default=True, action='store_true', help="Enable lattice refinement")
     parser.add_argument("--device", default="cuda", choices=['cuda', 'cpu'], help="Device to run on")
+    parser.add_argument("--preprocess", action='store_true', help="Enable Axis Alignment Preprocessing before unwarping")
+    parser.add_argument("--steps", type=int, default=1, help="Number of sequential unwarping passes")
     args = parser.parse_args()
     
     if args.device == 'cuda':
@@ -476,4 +621,4 @@ if __name__ == "__main__":
     else:
         device = torch.device("cpu")
         
-    visualize_results(args.model, args.uvdoc_dir, args.doc3d_dir, args.uvdoc_raw_dir, args.doc3d_raw_dir, args.out, args.n, device, args.points, args.method, args.refine)
+    visualize_results(args.model, args.uvdoc_dir, args.doc3d_dir, args.uvdoc_raw_dir, args.doc3d_raw_dir, args.out, args.n, device, args.points, args.method, args.refine, args.preprocess, args.steps)

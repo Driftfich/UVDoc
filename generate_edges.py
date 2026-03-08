@@ -236,7 +236,71 @@ def generate_doc3d_edges(base_dir: Path):
         warped_map = cv2.remap(flat_map, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         cv2.imwrite(str(dest_warped_path), (warped_map * 255).astype(np.uint8))
 
-if __name__ == "__main__":
+def generate_inv3d_edges(base_dir: Path):
+    print(f"\n--- Generating Inv3D Edges in {base_dir} ---")
+    src_flat_dir = base_dir / "flat_alb"
+    src_warped_dir = base_dir / "warped_alb"
+    src_img_dir = base_dir / "img"
+    src_uv_dir = base_dir / "uv"
+    
+    dest_flat_dir = base_dir / "flat_edges"
+    dest_warped_dir = base_dir / "warped_edges"
+
+    dest_flat_dir.mkdir(exist_ok=True, parents=True)
+    dest_warped_dir.mkdir(exist_ok=True, parents=True)
+
+    if not src_flat_dir.exists():
+        print(f"Inv3D 'flat_alb' directory not found in {base_dir}. Skipping.")
+        return
+    
+    flat_files = list(src_flat_dir.glob("*.png"))
+    print(f"Found {len(flat_files)} Inv3D samples.")
+
+    # Enable EXR for OpenCV
+    os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+
+    for flat_path in tqdm(flat_files, desc="Inv3D"):
+        img_id = flat_path.stem
+        dest_flat_path = dest_flat_dir / f"{img_id}.png"
+        dest_warped_path = dest_warped_dir / f"{img_id}.png"
+
+        # Optimization
+        if dest_flat_path.exists() and dest_warped_path.exists():
+            continue
+
+        # 1. Flat Edges
+        flat_alb = cv2.imread(str(flat_path))
+        if flat_alb is None: continue
+
+        flat_map = compute_edge_map_from_image(flat_alb)
+        if flat_map is None: continue
+
+        cv2.imwrite(str(dest_flat_path), (flat_map * 255).astype(np.uint8))
+
+        # load uv map
+        uv_path = src_uv_dir / f"{img_id}.npy"
+        if not uv_path.exists(): continue
+
+        uv = np.load(str(uv_path))
+        if uv is None: continue
+
+        if uv.shape[:2] != TARGET_SIZE:
+            uv = cv2.resize(uv, (TARGET_SIZE[1], TARGET_SIZE[0]), interpolation=cv2.INTER_LINEAR)
+
+        h_flat, w_flat = flat_map.shape
+
+        u, v, mask = uv[..., 0], uv[..., 1], uv[..., 2]
+
+        # use mask to send background pixels out-of-bounds (→ borderValue=0)
+        map_x = np.where(mask > 0.5, u * (w_flat - 1), -1.0).astype(np.float32)
+        map_y = np.where(mask > 0.5, v * (h_flat - 1), -1.0).astype(np.float32)
+
+        warped_map = cv2.remap(flat_map, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        cv2.imwrite(str(dest_warped_path), (warped_map * 255).astype(np.uint8))
+
+    print("Done generating Inv3D edges.")
+
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw_dir", default="downloads", help="Root downloads folder containing UVDoc_final and/or doc3d_raw")
     args = parser.parse_args()
@@ -261,3 +325,13 @@ if __name__ == "__main__":
          # The new logic requires flat_albedo which might not be in doc3d_raw.
          # So we assume if flat_albedo is not found, we can't proceed with new logic.
          print("Doc3D flat_albedo not found in dataset_doc3d. Please prepare flat albedos first.")
+
+    inv3d_path = Path("dataset_inv3d")
+    if inv3d_path.exists():
+        for split in ["train", "val", "test"]:
+            split_path = inv3d_path / split
+            if split_path.exists():
+                generate_inv3d_edges(split_path)
+
+if __name__ == "__main__":
+    main()

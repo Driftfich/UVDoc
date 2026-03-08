@@ -17,6 +17,7 @@ import torch
 from huggingface_hub import snapshot_download
 import torch.nn.functional as F
 import os
+from generate_edges import main as generate_edges_main
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
@@ -689,7 +690,7 @@ def uncapsulate_inv3d_data(raw_dir: Path, mid_dir: Path):
     """
     1. Locates all the zip files in the raw_dir OR nested within mid_dir (after untarring)
     2. Unzips the zip files into the mid_dir
-    3. Within the mid_dir, locate all dirs with format "\d{5}" (e.g. 00000)
+    3. Within the mid_dir, locate all dirs with format "\\d{5}" (e.g. 00000)
     4. For each dir, copy flat document (albedo), warped albedo, warped document (img) pngs and warped_UV.npz files 
     5. Drop the doc_dirs and keep the mid_dirs
     """
@@ -858,6 +859,34 @@ def create_inv3d_dataset(raw_dir: Path, mid_dir: Path, output_dir: Path):
 
     return
 
+def check_missing_inv3d_data(mid_dir: Path, output_dir: Path) -> bool:
+    """
+    Check if there is less data within output_dir / img than in mid_dir / img
+    Returns True if there is missing data, False otherwise
+    """
+    mid_img_dir = mid_dir / "img"
+    output_img_dir = output_dir / "img"
+    output_uv_dir = output_dir / "uv"
+    output_shading_dir = output_dir / "shading"
+    output_flat_alb_dir = output_dir / "flat_alb"
+    output_warped_alb_dir = output_dir / "warped_alb"
+
+    if not mid_img_dir.exists():
+        return True
+
+    mid_img_files = {f.stem for f in mid_img_dir.glob("*.png")}
+    output_img_files = {f.stem for f in output_img_dir.glob("*.png")}
+    output_uv_files = {f.stem for f in output_uv_dir.glob("*.npy")}
+    output_shading_files = {f.stem for f in output_shading_dir.glob("*.png")}
+    output_flat_alb_files = {f.stem for f in output_flat_alb_dir.glob("*.png")}
+    output_warped_alb_files = {f.stem for f in output_warped_alb_dir.glob("*.png")}
+
+    return not (mid_img_files.issubset(output_img_files) and 
+            mid_img_files.issubset(output_uv_files) and
+            mid_img_files.issubset(output_shading_files) and
+            mid_img_files.issubset(output_flat_alb_files) and
+            mid_img_files.issubset(output_warped_alb_files))
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw_dir", default=DOWNLOAD_DIR)
@@ -866,7 +895,10 @@ def main():
     parser.add_argument("--inv3d_out_dir", default=INV3D_DATASET_DIR)
     parser.add_argument("--url", default=DATASET_URL)
     parser.add_argument("--doc3d_dir", default=DOC3D_DIR)
-    parser.add_argument("--skip_doc3d", action='store_true')
+    parser.add_argument("--rebuild_uvdoc", action='store_true')
+    parser.add_argument("--rebuild_doc3d", action='store_true')
+    parser.add_argument("--rebuild_inv3d", action='store_true')
+    parser.add_argument("--skip_generate_edges", action='store_true')
 
     args = parser.parse_args()
     
@@ -879,7 +911,7 @@ def main():
     uvdoc_out_dir.mkdir(parents=True, exist_ok=True)
 
     # Download the dataset and unzip if UVDoc_final dir not present
-    if not (raw / "UVDoc_final").exists():
+    if not (raw / "UVDoc_final").exists() or args.rebuild_uvdoc:
         if not (raw / "UVDoc_final.zip").exists():
             print("UVDoc_final.zip not found. Downloading...")
             download_file(urls, raw / "UVDoc_final.zip")
@@ -894,10 +926,11 @@ def main():
     print("Done with UVDoc dataset.")
 
     # download Doc3D from huggingface
-    if not args.skip_doc3d:
+    if not Path(args.doc3d_out_dir).exists() or args.rebuild_doc3d:
         print(f"Downloading Doc3D from huggingface {args.doc3d_dir}...")
         # number of partitions to download from all available 21 Doc3D partitions
         max_partitions = 8
+        max_partitions = min(max_partitions, 21)
         patterns = []
         for cat in ["img", "alb", "bm", "uv"]:
             for i in range(1, max_partitions + 1):
@@ -911,8 +944,8 @@ def main():
     else:
         print("Skipping Doc3D dataset.")
 
-    raw = Path("/media/driftfich/Backup-Volume/downloads")
-    raw.mkdir(parents=True, exist_ok=True)
+    # raw = Path("/media/driftfich/Backup-Volume/downloads")
+    # raw.mkdir(parents=True, exist_ok=True)
     download_dir = raw / INV3D_DATASET_DIR / "raw"
     download_train_dir = download_dir / "train"
     download_val_dir = download_dir / "val"
@@ -929,17 +962,23 @@ def main():
     unzipped_val_dir.mkdir(parents=True, exist_ok=True)
     unzipped_test_dir.mkdir(parents=True, exist_ok=True)
 
-    inv3d_train_partitions: int = 1
+    inv3d_train_partitions: int = 3
     inv3d_val_partitions: int = 0
     inv3d_test_partitions: int = 0
 
     for part, count, urls in zip(["train", "val", "test"], [inv3d_train_partitions, inv3d_val_partitions, inv3d_test_partitions], [INV3D_URLS_TRAIN, INV3D_URLS_VAL, INV3D_URLS_TEST]):
         for i in range(min(count, len(urls))):
-            download_file(urls[i], raw / INV3D_DATASET_DIR / "raw" / part / f"inv3d_{part}_{i}.tar")
-            untar_file(raw / INV3D_DATASET_DIR / "raw" / part / f"inv3d_{part}_{i}.tar", raw / INV3D_DATASET_DIR / "unzipped" / part / f"inv3d_{part}_{i}")
-            create_inv3d_dataset(raw / INV3D_DATASET_DIR / "unzipped" / part / f"inv3d_{part}_{i}", raw / INV3D_DATASET_DIR / "processed" / part / f"inv3d_{part}_{i}", INV3D_DATASET_DIR / part)
-            # remove the content of the unzipped dir
-            shutil.rmtree(raw / INV3D_DATASET_DIR / "unzipped" / part / f"inv3d_{part}_{i}")
+            missing_data: bool = check_missing_inv3d_data(raw / INV3D_DATASET_DIR / "processed" / part / f"inv3d_{part}_{i}", INV3D_DATASET_DIR / part)
+            print(f"Missing data: {missing_data}")
+            if missing_data or args.rebuild_inv3d:
+                download_file(urls[i], download_dir / part / f"inv3d_{part}_{i}.tar")
+                untar_file(download_dir / part / f"inv3d_{part}_{i}.tar", unzipped_dir / part / f"inv3d_{part}_{i}")
+                create_inv3d_dataset(unzipped_dir / part / f"inv3d_{part}_{i}", raw / INV3D_DATASET_DIR / "processed" / part / f"inv3d_{part}_{i}", INV3D_DATASET_DIR / part)
+                # remove the content of the unzipped dir
+                shutil.rmtree(unzipped_dir / part / f"inv3d_{part}_{i}")
+
+    if not args.skip_generate_edges:
+        generate_edges_main()
 
 if __name__ == "__main__":
     main()
