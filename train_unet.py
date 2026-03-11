@@ -30,11 +30,11 @@ w_grad = 4.0 # Gradient Loss => Forces similar gradient in the GT and Predicted 
 w_shading = 0.0 # Shading Loss => temporarily disabled
 w_stiffness = 2.0 # Stiffness Loss => Paper Curvature Assumption
 w_tv_shading = 0.0 # TV Shading Loss => Shading Smoothness Loss => temporarily disabled
-w_rigidity = 2.0 # Jacobian Rigidity Loss => Local Uniformity in the Predicted UV Map => Wobbly Lines Fix
+w_rigidity = 0.0 # Jacobian Rigidity Loss => Local Uniformity in the Predicted UV Map => Wobbly Lines Fix, DEACTIVATED, because computes the same as stiffness loss
 w_structure = 8.0 # Structure Loss => Edge Alignment Loss
 
 # NEW: Content / Perceptual Losses (Replaces old 'Structure' loss)
-w_reproj = 2.0    # Pixel L1 diff between Unwarped Prediction and Flat GT
+w_reproj = 1.0    # Pixel L1 diff between Unwarped Prediction and Flat GT
 w_msssim = 0.0     # MS-SSIM Perceptual loss
 w_vgg = 0.0        # VGG Perceptual loss (Feature matching)
 

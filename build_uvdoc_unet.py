@@ -962,7 +962,7 @@ def main():
     unzipped_val_dir.mkdir(parents=True, exist_ok=True)
     unzipped_test_dir.mkdir(parents=True, exist_ok=True)
 
-    inv3d_train_partitions: int = 3
+    inv3d_train_partitions: int = 4
     inv3d_val_partitions: int = 0
     inv3d_test_partitions: int = 0
 
