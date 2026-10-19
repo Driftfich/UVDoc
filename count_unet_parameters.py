@@ -1,4 +1,4 @@
-from train_unet import FastViTUNet
+from models import FastViTUNet
 import torch
 import time
 from thop import profile
@@ -6,9 +6,9 @@ from thop import profile
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device = torch.device("cpu")
 
-model = FastViTUNet().to(device)
+model = FastViTUNet(pretrained=False).to(device)
 try:
-    model.load_state_dict(torch.load("unet_best.pth", map_location=device))
+    model.load_state_dict(torch.load("unet_bm_best.pth", map_location=device))
 except FileNotFoundError:
     pass
 model.eval()

@@ -74,99 +74,44 @@ def compute_edge_map_from_image(img, size=TARGET_SIZE):
     
     return weight_map
 
-def generate_uvdoc_edges(raw_dir: Path):
-    print(f"\n--- Generating UVDoc Edges in {raw_dir} ---")
-    src_meta_dir = raw_dir / "metadata_sample"
-    src_tex_dir = raw_dir / "textures"
-    src_img_dir = raw_dir / "img"
-    src_grid_dir = raw_dir / "grid2d"
-    
-    dest_flat_dir = raw_dir / "flat_edges"
-    dest_warped_dir = raw_dir / "warped_edges"
-    
+def generate_uvdoc_edges(base_dir: Path):
+    """base_dir: one split of the built UVDoc dataset (e.g. dataset_unet/train)."""
+    print(f"\n--- Generating UVDoc Edges in {base_dir} ---")
+    src_flat_dir = base_dir / "flat_tex"
+    src_uv_dir = base_dir / "masks"
+
+    dest_flat_dir = base_dir / "flat_edges"
+    dest_warped_dir = base_dir / "warped_edges"
+
     dest_flat_dir.mkdir(exist_ok=True, parents=True)
     dest_warped_dir.mkdir(exist_ok=True, parents=True)
-    
-    if not src_meta_dir.exists():
-        print("UVDoc metadata not found. Skipping.")
+
+    if not src_flat_dir.exists():
+        print(f"UVDoc 'flat_tex' directory not found in {base_dir}. Rebuild with build_uvdoc_unet.py. Skipping.")
         return
 
-    meta_files = list(src_meta_dir.glob("*.json"))
-    flat_cache = {}
-    
-    for meta_path in tqdm(meta_files, desc="UVDoc"):
-        img_id = meta_path.stem
+    for flat_path in tqdm(list(src_flat_dir.glob("*.png")), desc="UVDoc"):
+        img_id = flat_path.stem
         dest_flat_path = dest_flat_dir / f"{img_id}.png"
         dest_warped_path = dest_warped_dir / f"{img_id}.png"
-        
-        # Optimization: Skip if done
+
         if dest_flat_path.exists() and dest_warped_path.exists():
             continue
-            
-        try:
-            with open(meta_path, 'r') as f: meta = json.load(f)
-        except: continue
-            
-        # 1. Flat Edge Map
-        tex_rel_path = meta.get("texture_name")
-        if not tex_rel_path: continue
-        tex_name = Path(tex_rel_path).name
-        
-        if tex_name in flat_cache:
-            flat_map = flat_cache[tex_name]
-        else:
-            tex_path = src_tex_dir / tex_name
-            if not tex_path.exists(): continue
-            tex_img = cv2.imread(str(tex_path))
-            flat_map = compute_edge_map_from_image(tex_img)
-            if flat_map is not None: flat_cache[tex_name] = flat_map
-        
+
+        flat_map = compute_edge_map_from_image(cv2.imread(str(flat_path)))
         if flat_map is None: continue
         cv2.imwrite(str(dest_flat_path), (flat_map * 255).astype(np.uint8))
 
-        # 2. Warped Edge Map (via Sparse Grid Interpolation)
-        geom_name = meta.get("geom_name")
-        mat_path = src_grid_dir / f"{geom_name}.mat"
-        if not mat_path.exists(): continue
-        
-        map_data, source = load_mat_file(mat_path)
-        if map_data is None: continue
-        
-        if source == 'h5py' and map_data.shape[0] == 2: 
-            map_data = np.transpose(map_data, (2, 1, 0))
-        elif source == 'scipy' and map_data.ndim == 3 and map_data.shape[0] == 2: 
-            map_data = np.transpose(map_data, (1, 2, 0))
+        # Forward UV (ch0, ch1), -1 marks background
+        uv_path = src_uv_dir / f"{img_id}.npy"
+        if not uv_path.exists(): continue
+        uv = np.load(str(uv_path))[..., :2]
 
-        # Get original image dims
-        img_path = src_img_dir / f"{img_id}.jpg"
-        if not img_path.exists(): img_path = src_img_dir / f"{img_id}.png"
-        if not img_path.exists(): continue
-        
-        # We need dims to normalize grid points
-        # Using PIL or just cv2 shape is fast enough
-        img_temp = cv2.imread(str(img_path))
-        if img_temp is None: continue
-        h_img, w_img = img_temp.shape[:2]
+        h_flat, w_flat = flat_map.shape
+        doc = uv[..., 0] >= 0
+        map_x = np.where(doc, uv[..., 0] * (w_flat - 1), -1.0).astype(np.float32)
+        map_y = np.where(doc, uv[..., 1] * (h_flat - 1), -1.0).astype(np.float32)
 
-        # Interpolate Flat Map -> Warped Domain
-        grid_h, grid_w, _ = map_data.shape
-        points_x = map_data[..., 0].flatten() / w_img
-        points_y = map_data[..., 1].flatten() / h_img
-        
-        u_grid, v_grid = np.meshgrid(np.linspace(0, 1, grid_w), np.linspace(0, 1, grid_h))
-        
-        points = np.stack([points_x, points_y], axis=1)
-        grid_x, grid_y = np.meshgrid(np.linspace(0, 1, TARGET_SIZE[1]), np.linspace(0, 1, TARGET_SIZE[0]))
-        
-        # Inverse mapping: Where does each pixel in Warped Image come from in Flat UV?
-        try:
-            dense_u = griddata(points, u_grid.flatten(), (grid_x, grid_y), method='linear', fill_value=-1)
-            dense_v = griddata(points, v_grid.flatten(), (grid_x, grid_y), method='linear', fill_value=-1)
-        except: continue
-        
-        map_x = (dense_u * (TARGET_SIZE[1] - 1)).astype(np.float32)
-        map_y = (dense_v * (TARGET_SIZE[0] - 1)).astype(np.float32)
-        
         warped_map = cv2.remap(flat_map, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         cv2.imwrite(str(dest_warped_path), (warped_map * 255).astype(np.uint8))
 
@@ -302,29 +247,19 @@ def generate_inv3d_edges(base_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--raw_dir", default="downloads", help="Root downloads folder containing UVDoc_final and/or doc3d_raw")
-    args = parser.parse_args()
-    
-    root_path = Path(args.raw_dir)
-    
-    # Check for UVDoc
-    uvdoc_path = root_path / "UVDoc_final"
-    if uvdoc_path.exists():
-        generate_uvdoc_edges(uvdoc_path)
-    elif (root_path / "img").exists() and (root_path / "grid2d").exists():
-        # Maybe raw_dir points directly to UVDoc
-        generate_uvdoc_edges(root_path)
-        
-    # Check for Doc3D
-    # Prioritize dataset_doc3d if it exists and has flat_albedo
+    parser.add_argument("--uvdoc_dir", default="dataset_unet", help="Built UVDoc dataset (with train/val splits)")
+    args, _ = parser.parse_known_args()
+
+    uvdoc_path = Path(args.uvdoc_dir)
+    for split in ["train", "val"]:
+        if (uvdoc_path / split).exists():
+            generate_uvdoc_edges(uvdoc_path / split)
+
     doc3d_dataset_path = Path("dataset_doc3d")
     if (doc3d_dataset_path / "flat_albedo").exists():
         generate_doc3d_edges(doc3d_dataset_path)
-    elif (root_path / "doc3d_raw").exists():
-         # Fallback to old path structure but using new logic?
-         # The new logic requires flat_albedo which might not be in doc3d_raw.
-         # So we assume if flat_albedo is not found, we can't proceed with new logic.
-         print("Doc3D flat_albedo not found in dataset_doc3d. Please prepare flat albedos first.")
+    else:
+        print("Doc3D flat_albedo not found in dataset_doc3d. Please prepare flat albedos first.")
 
     inv3d_path = Path("dataset_inv3d")
     if inv3d_path.exists():

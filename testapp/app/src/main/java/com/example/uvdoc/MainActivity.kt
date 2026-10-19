@@ -9,6 +9,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.provider.MediaStore
 import android.view.View
 import android.widget.Button
@@ -275,7 +276,14 @@ class MainActivity : AppCompatActivity() {
         
         cameraExecutor.execute {
             val startTime = System.currentTimeMillis()
-            val result = imageProcessor.processImage(bitmap)
+            var failure: String? = null
+            val result = try {
+                imageProcessor.processImage(bitmap)
+            } catch (e: Exception) {
+                failure = e.message ?: e.toString()
+                Log.e("MainActivity", "processImage failed", e)
+                null
+            }
             val time = System.currentTimeMillis() - startTime
             
             runOnUiThread {
@@ -286,7 +294,8 @@ class MainActivity : AppCompatActivity() {
                     currentBitmap = result // So we can't process again recursively
                     Toast.makeText(this, "Processed in ${time}ms", Toast.LENGTH_SHORT).show()
                 } else {
-                    Toast.makeText(this, "Processing failed", Toast.LENGTH_SHORT).show()
+                    val detail = failure ?: imageProcessor.loadError ?: "unknown"
+                    Toast.makeText(this, "Processing failed: $detail", Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -294,6 +303,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        cameraExecutor.execute { imageProcessor.close() }
         cameraExecutor.shutdown()
     }
 }

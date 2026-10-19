@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -18,6 +19,7 @@ from huggingface_hub import snapshot_download
 import torch.nn.functional as F
 import os
 from generate_edges import main as generate_edges_main
+from backward_map import bm_from_point_grid
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
@@ -183,50 +185,57 @@ def compute_texture_edge_map(tex_path, target_size):
     except Exception:
         return np.zeros(target_size, dtype=np.float32)
 
+def uvdoc_split(img_id: str) -> str:
+    """Deterministic 80/20 split (Python's hash() is randomized per process)."""
+    return "val" if int(hashlib.md5(img_id.encode()).hexdigest(), 16) % 5 == 0 else "train"
+
+# Per-sample outputs of the UVDoc build: sub dir -> file extension
+UVDOC_OUTPUTS = {"images": "jpg", "masks": "npy", "bm": "npy", "flat_tex": "png", "warped_tex": "png"}
+
+def uvdoc_output_paths(output_dir: Path, split: str, img_id: str) -> dict:
+    return {sub: output_dir / split / sub / f"{img_id}.{ext}" for sub, ext in UVDOC_OUTPUTS.items()}
+
 def process_uvdoc_dataset(raw_dir: Path, output_dir: Path):
     """
-    Generates (Image, UV_Map) pairs for UNet training.
-    UV Map: (H, W, 2) array where ch0=u, ch1=v (normalized 0-1).
+    Builds a self-contained UVDoc dataset (raw_dir can be deleted afterwards):
+      images/     256px input image
+      masks/      (H, W, 6): forward UV (ch0-1, -1 = background), shading (ch2-4), edge weights (ch5)
+      bm/         (2, 32, 32) backward map from grid2d (see backward_map.py)
+      flat_tex/   256px flat texture
+      warped_tex/ 256px clean (shading-free) warped texture
     """
-    
-    img_dir_train = output_dir / "train" / "images"
-    mask_dir_train = output_dir / "train" / "masks" # UV maps
-    img_dir_val = output_dir / "val" / "images"
-    mask_dir_val = output_dir / "val" / "masks"
-    
-    for d in [img_dir_train, mask_dir_train, img_dir_val, mask_dir_val]:
-        d.mkdir(parents=True, exist_ok=True)
+    for split in ["train", "val"]:
+        for sub in UVDOC_OUTPUTS:
+            (output_dir / split / sub).mkdir(parents=True, exist_ok=True)
 
     src_img_dir = raw_dir / "img"
     src_meta_dir = raw_dir / "metadata_sample"
     src_img_geom_dir = raw_dir / "img_geom"
     src_grid_dir = raw_dir / "grid2d"
     src_tex_dir = raw_dir / "textures"
+    src_warped_tex_dir = raw_dir / "warped_textures"
     
     if not src_img_dir.exists():
         print(f"Error: {src_img_dir} not found.")
         return
 
     images = list(src_img_dir.glob("*.png")) + list(src_img_dir.glob("*.jpg"))
-    existing_train_img_ids = np.array([img_path.stem for img_path in img_dir_train.glob("*.jpg")])
-    existing_train_mask_ids = np.array([img_path.stem for img_path in mask_dir_train.glob("*.npy")])
-    existing_val_img_ids = np.array([img_path.stem for img_path in img_dir_val.glob("*.jpg")])
-    existing_val_mask_ids = np.array([img_path.stem for img_path in mask_dir_val.glob("*.npy")])
 
-    # an id exists if its present in train or val img and mask
-    existing_train_ids = np.intersect1d(existing_train_img_ids, existing_train_mask_ids)
-    existing_val_ids = np.intersect1d(existing_val_img_ids, existing_val_mask_ids)
-    existing_ids = np.concatenate([existing_train_ids, existing_val_ids])
+    def is_complete(img_id):
+        return all(p.exists() for p in uvdoc_output_paths(output_dir, uvdoc_split(img_id), img_id).values())
 
-    images = [img_path for img_path in images if img_path.stem not in existing_ids]
-    print(f"Found {len(images)} new images. Already existing processed images: {len(existing_ids)}")
+    images = [img_path for img_path in images if not is_complete(img_path.stem)]
+    print(f"Found {len(images)} images to (re)process.")
     
-    # Simple split based on hash
     for img_path in tqdm(images, desc="Processing"):
         img_id = img_path.stem
+        split = uvdoc_split(img_id)
+        out_paths = uvdoc_output_paths(output_dir, split, img_id)
 
-        if Path(img_dir_train / f"{img_id}.jpg").exists() and Path(img_dir_val / f"{img_id}.jpg").exists() and Path(mask_dir_train / f"{img_id}.npy").exists() and Path(mask_dir_val / f"{img_id}.npy").exists():
-            continue
+        # Remove stale copies left in the other split by the old random split
+        other = "train" if split == "val" else "val"
+        for p in uvdoc_output_paths(output_dir, other, img_id).values():
+            p.unlink(missing_ok=True)
         
         # 1. Load Metadata
         meta_path = src_meta_dir / f"{img_id}.json"
@@ -385,17 +394,32 @@ def process_uvdoc_dataset(raw_dir: Path, output_dir: Path):
         
         # -1 indicates background (outside document hull).
         # We can treat this as a mask for loss calculation.
-        
-        # Save
-        is_train = (hash(img_id) % 5 != 0)
-        dest_img_dir = img_dir_train if is_train else img_dir_val
-        dest_mask_dir = mask_dir_train if is_train else mask_dir_val
-        
-        # Save Image
-        cv2.imwrite(str(dest_img_dir / f"{img_id}.jpg"), img_resized)
-        
-        # Save UV Map as .npy (float precision is crucial for dewarping)
-        np.save(str(dest_mask_dir / f"{img_id}.npy"), combined_label)
+
+        # Exact backward map: grid2d already maps flat grid points -> image pixels
+        bm = bm_from_point_grid(map_data, w_img, h_img)
+
+        # Flat texture and its clean warped counterpart
+        tex = cv2.imread(str(src_tex_dir / Path(tex_rel_path).name)) if tex_rel_path else None
+        if tex is None: continue
+        flat_tex = cv2.resize(tex, TARGET_SIZE)
+
+        warped_tex_src = cv2.imread(str(src_warped_tex_dir / f"{img_id}.png"))
+        if warped_tex_src is not None:
+            warped_tex = cv2.resize(warped_tex_src, TARGET_SIZE)
+        else:
+            # Fallback: warp the flat texture with the forward UV map (background -> black)
+            doc = uv_map[..., 0] >= 0
+            map_x = np.where(doc, uv_map[..., 0] * (TARGET_SIZE[0] - 1), -1).astype(np.float32)
+            map_y = np.where(doc, uv_map[..., 1] * (TARGET_SIZE[1] - 1), -1).astype(np.float32)
+            warped_tex = cv2.remap(flat_tex, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                                   borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+        cv2.imwrite(str(out_paths["images"]), img_resized)
+        # float precision is crucial for dewarping
+        np.save(str(out_paths["masks"]), combined_label)
+        np.save(str(out_paths["bm"]), bm)
+        cv2.imwrite(str(out_paths["flat_tex"]), flat_tex)
+        cv2.imwrite(str(out_paths["warped_tex"]), warped_tex)
 
 def reconstruct_flat_albedo_tensor(alb, bm):
     """
